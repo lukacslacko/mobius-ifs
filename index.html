@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Möbius IFS — Circle</title>
+<title>Möbius IFS — Color</title>
 <style>
   * { margin: 0; padding: 0; }
   body { background: #000; overflow: hidden; font-family: monospace; }
@@ -26,6 +26,7 @@
     <option value="5">5</option><option value="6">6</option>
   </select></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
+  <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <button id="randomize">Randomize</button>
   <span id="fps"></span>
 </div>
@@ -46,7 +47,6 @@ gl.getExtension('OES_texture_float_linear');
 
 const SIZE = canvas.width;
 const SCALE = 4.0;
-const MAX_T = 6; // max transforms
 
 function makeTex() {
   const t = gl.createTexture();
@@ -65,17 +65,19 @@ function makeFBO(t) {
   return f;
 }
 
+// RGB density: R, G, B channels each store independent density
 const init = new Float32Array(SIZE*SIZE*4);
-for (let i = 0; i < SIZE*SIZE; i++) { init[i*4]=1; init[i*4+3]=1; }
+for (let i = 0; i < SIZE*SIZE; i++) { init[i*4]=1; init[i*4+1]=1; init[i*4+2]=1; init[i*4+3]=1; }
+
 const texA=makeTex(), texB=makeTex(), texC=makeTex();
 for (const t of [texA,texB,texC]) {
-  gl.bindTexture(gl.TEXTURE_2D,t);
-  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIZE,SIZE,0,gl.RGBA,gl.FLOAT,init);
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, init);
 }
 const fboA=makeFBO(texA), fboB=makeFBO(texB), fboC=makeFBO(texC);
 
 const qb=gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER,qb);
+gl.bindBuffer(gl.ARRAY_BUFFER, qb);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
 
 function sh(s,t){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
@@ -87,22 +89,37 @@ const VS=`#version 300 es
 in vec2 pos; out vec2 uv;
 void main(){uv=pos*0.5+0.5;gl_Position=vec4(pos,0,1);}`;
 
-// Iteration shader: supports up to 6 transforms via uniform nT
+// Iteration: each channel (R,G,B) is an independent density field.
+// All three are warped by the same Möbius maps with the same Jacobian,
+// but each transform has a color weight: transform k contributes
+// 2x weight to its assigned channel(s).
+// 1→R, 2→G, 3→B, 4→RG, 5→RB, 6→GB
 const iterProg = pr(VS, `#version 300 es
 precision highp float;
 in vec2 uv; out vec4 fragColor;
 uniform sampler2D uD;
-uniform float a[24]; // up to 6×4 angles
+uniform float a[24];
 uniform float sc;
 uniform float pixSize;
-uniform int nT; // number of active transforms
+uniform int nT;
+uniform float cw; // color weight (boost for assigned channel)
 
 vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
 
-float sampleAt(vec2 w){
+vec3 colorWeight(int t) {
+  if(t==0) return vec3(cw, 1.0, 1.0);
+  if(t==1) return vec3(1.0, cw, 1.0);
+  if(t==2) return vec3(1.0, 1.0, cw);
+  if(t==3) return vec3(cw, cw, 1.0);
+  if(t==4) return vec3(cw, 1.0, cw);
+  return vec3(1.0, cw, cw);
+}
+
+vec3 sampleAt(vec2 w){
   float R2 = sc*sc*0.25;
-  if(dot(w,w) > R2) return 0.0;
-  float acc=0.0;
+  if(dot(w,w) > R2) return vec3(0.0);
+  vec3 acc = vec3(0.0);
+  vec3 wTotal = vec3(0.0);
   for(int t=0;t<6;t++){
     if(t>=nT) break;
     vec2 A=vec2(cos(a[t*4]),sin(a[t*4])),B=vec2(cos(a[t*4+1]),sin(a[t*4+1])),
@@ -112,53 +129,71 @@ float sampleAt(vec2 w){
     vec2 z=vec2(dot(n,d)/ds,(n.y*d.x-n.x*d.y)/ds);
     vec2 ad=cm(A,D),bc=cm(B,C),det=ad-bc;
     float j=dot(det,det)/(ds*ds);
-    // Check preimage is inside disk
-    if(dot(z,z) <= sc*sc*0.25){
+    if(dot(z,z) <= R2){
       vec2 s=z/sc+0.5;
-      acc+=texture(uD,s).r*j;
+      vec3 sampled = texture(uD,s).rgb;
+      vec3 cw = colorWeight(t);
+      acc += sampled * j * cw;
+      wTotal += cw;
     }
   }
-  return acc/float(nT);
+  // Normalize each channel by its total weight
+  return vec3(
+    wTotal.r > 0.0 ? acc.r / wTotal.r : 0.0,
+    wTotal.g > 0.0 ? acc.g / wTotal.g : 0.0,
+    wTotal.b > 0.0 ? acc.b / wTotal.b : 0.0
+  );
 }
 
 void main(){
   vec2 w=(uv-0.5)*sc;
-  if(dot(w,w) > sc*sc*0.25){ fragColor=vec4(0.001,0,0,1); return; }
+  float R2 = sc*sc*0.25;
+  if(dot(w,w) > R2){ fragColor=vec4(0.001,0.001,0.001,1); return; }
   float step=pixSize*sc/4.0;
-  float v=0.0;
+  vec3 v=vec3(0.0);
   for(int iy=0;iy<4;iy++)
     for(int ix=0;ix<4;ix++)
       v+=sampleAt(w+vec2((float(ix)-1.5)*step,(float(iy)-1.5)*step));
-  v=max(v/16.0,0.001);
-  fragColor=vec4(v,0,0,1);
+  v = max(v/16.0, vec3(0.001));
+  fragColor=vec4(v, 1.0);
 }`);
 
+// Normalization: scale each channel independently to avg=1
 const normProg = pr(VS, `#version 300 es
 precision highp float;
 in vec2 uv; out vec4 fragColor;
-uniform sampler2D uD; uniform float uS;
-void main(){ fragColor=vec4(max(texture(uD,uv).r*uS, 0.001),0,0,1); }`);
+uniform sampler2D uD;
+uniform vec3 uS; // per-channel scale
+void main(){
+  vec3 v = texture(uD,uv).rgb * uS;
+  fragColor=vec4(max(v, vec3(0.001)), 1.0);
+}`);
 
+// Display: log-scale each channel independently, then show as RGB
 const dispProg = pr(VS, `#version 300 es
 precision highp float;
 in vec2 uv; out vec4 fragColor;
-uniform sampler2D uD; uniform float uLM; uniform float uG;
+uniform sampler2D uD;
+uniform vec3 uLM; // log(1+max) per channel
+uniform float uG;
 void main(){
   vec2 c = uv - 0.5;
   if(dot(c,c) > 0.25){ fragColor=vec4(0,0,0,1); return; }
-  float d=texture(uD,uv).r;
-  float v=uLM>0.001?pow(clamp(log(1.0+abs(d))/uLM,0.0,1.0),uG):0.0;
-  fragColor=vec4(v,v,v,1);
+  vec3 d = texture(uD,uv).rgb;
+  vec3 v;
+  v.r = uLM.r>0.001 ? pow(clamp(log(1.0+abs(d.r))/uLM.r,0.0,1.0),uG) : 0.0;
+  v.g = uLM.g>0.001 ? pow(clamp(log(1.0+abs(d.g))/uLM.g,0.0,1.0),uG) : 0.0;
+  v.b = uLM.b>0.001 ? pow(clamp(log(1.0+abs(d.b))/uLM.b,0.0,1.0),uG) : 0.0;
+  fragColor=vec4(v,1);
 }`);
 
-// Parameters: up to 6 transforms × 4 angles = 24
 const rng=(function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
 const baseAngles=new Float32Array(24), vels=new Float32Array(24);
 for(let i=0;i<24;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
 
-let nFuncs = 3;
-let pp=0, frame=0, lastT=performance.now(), fpsS=0, logMax=1.0;
-const phases = new Float32Array(24); // accumulated phase per angle
+let nFuncs=3, pp=0, frame=0, lastT=performance.now(), fpsS=0;
+const logMax=new Float32Array([1,1,1]);
+const phases=new Float32Array(24);
 
 function drawQ(p){
   const a=gl.getAttribLocation(p,'pos');
@@ -171,12 +206,12 @@ function drawQ(p){
 function resetImage(){
   frame=0;
   const d=new Float32Array(SIZE*SIZE*4);
-  for(let i=0;i<SIZE*SIZE;i++){d[i*4]=1;d[i*4+3]=1;}
+  for(let i=0;i<SIZE*SIZE;i++){d[i*4]=1;d[i*4+1]=1;d[i*4+2]=1;d[i*4+3]=1;}
   for(const t of[texA,texB,texC]){
     gl.bindTexture(gl.TEXTURE_2D,t);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIZE,SIZE,0,gl.RGBA,gl.FLOAT,d);
   }
-  logMax=1.0;
+  logMax[0]=1; logMax[1]=1; logMax[2]=1;
 }
 
 function doIter(ang){
@@ -191,18 +226,27 @@ function doIter(ang){
   gl.uniform1f(gl.getUniformLocation(iterProg,'sc'),SCALE);
   gl.uniform1f(gl.getUniformLocation(iterProg,'pixSize'),1.0/SIZE);
   gl.uniform1i(gl.getUniformLocation(iterProg,'nT'),nFuncs);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'cw'),document.getElementById('colorwt').value/100.0);
   drawQ(iterProg);
 
-  const buf=new Float32Array(4); let sum=0,n=0;
+  // Sample for per-channel normalization
+  const buf=new Float32Array(4);
+  let sums=[0,0,0], n=0;
   const st=Math.floor(SIZE/16);
   for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
-    gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,buf); sum+=buf[0]; n++;
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,buf);
+    sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; n++;
   }
-  const avg=sum/n;
-  // If density collapsed, reset the image entirely
-  if(avg < 0.0001) { resetImage(); pp=1-pp; return; }
-  let sc=avg>1e-10?1.0/avg:1.0;
-  sc=Math.max(0.5,Math.min(1.5,sc));
+  const avgs=[sums[0]/n, sums[1]/n, sums[2]/n];
+
+  // If any channel collapsed, reset
+  if(avgs[0]<0.0001 && avgs[1]<0.0001 && avgs[2]<0.0001){ resetImage(); pp=1-pp; return; }
+
+  const sc = new Float32Array([
+    avgs[0]>1e-10 ? Math.min(Math.max(1.0/avgs[0],0.5),1.5) : 1.0,
+    avgs[1]>1e-10 ? Math.min(Math.max(1.0/avgs[1],0.5),1.5) : 1.0,
+    avgs[2]>1e-10 ? Math.min(Math.max(1.0/avgs[2],0.5),1.5) : 1.0,
+  ]);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER,wFBO);
   gl.viewport(0,0,SIZE,SIZE);
@@ -210,7 +254,7 @@ function doIter(ang){
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D,texC);
   gl.uniform1i(gl.getUniformLocation(normProg,'uD'),0);
-  gl.uniform1f(gl.getUniformLocation(normProg,'uS'),sc);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uS'),sc);
   drawQ(normProg);
   pp=1-pp;
 }
@@ -219,13 +263,20 @@ function display(){
   const rFBO=pp===0?fboA:fboB;
   if(frame%10===0){
     gl.bindFramebuffer(gl.FRAMEBUFFER,rFBO);
-    const b=new Float32Array(4); let mx=0;
+    const b=new Float32Array(4);
+    let mx=[0,0,0];
     const st=Math.floor(SIZE/8);
     for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
-      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b); mx=Math.max(mx,Math.abs(b[0]));
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);
+      mx[0]=Math.max(mx[0],Math.abs(b[0]));
+      mx[1]=Math.max(mx[1],Math.abs(b[1]));
+      mx[2]=Math.max(mx[2],Math.abs(b[2]));
     }
-    const nl=Math.log(1+mx); logMax=logMax*0.8+nl*0.2;
-    if(logMax<0.01)logMax=0.01;
+    for(let c=0;c<3;c++){
+      const nl=Math.log(1+mx[c]);
+      logMax[c]=logMax[c]*0.8+nl*0.2;
+      if(logMax[c]<0.01)logMax[c]=0.01;
+    }
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
   gl.viewport(0,0,canvas.width,canvas.height);
@@ -233,7 +284,7 @@ function display(){
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D,pp===0?texA:texB);
   gl.uniform1i(gl.getUniformLocation(dispProg,'uD'),0);
-  gl.uniform1f(gl.getUniformLocation(dispProg,'uLM'),logMax);
+  gl.uniform3fv(gl.getUniformLocation(dispProg,'uLM'),logMax);
   gl.uniform1f(gl.getUniformLocation(dispProg,'uG'),0.45);
   drawQ(dispProg);
 }
@@ -242,23 +293,20 @@ document.getElementById('randomize').addEventListener('click', function(){
   for(let i=0;i<24;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
   resetImage();
 });
-
 document.getElementById('nfuncs').addEventListener('change', function(){
-  nFuncs = parseInt(this.value);
-  resetImage();
+  nFuncs=parseInt(this.value); resetImage();
 });
 
 function loop(){
-  const speedPct = document.getElementById('speed').value / 100.0;
-  const dt = 1.0 / 60.0;
-  // Accumulate phase incrementally so speed changes don't cause jumps
-  for(let i=0;i<24;i++) phases[i] += vels[i] * dt * speedPct;
-  const ang = new Float32Array(24);
-  for(let i=0;i<24;i++) ang[i] = baseAngles[i] + phases[i];
+  const speedPct=document.getElementById('speed').value/100.0;
+  const dt=1.0/60.0;
+  for(let i=0;i<24;i++) phases[i]+=vels[i]*dt*speedPct;
+  const ang=new Float32Array(24);
+  for(let i=0;i<24;i++) ang[i]=baseAngles[i]+phases[i];
   doIter(ang);
   display();
   frame++;
-  const now=performance.now(), el=now-lastT; lastT=now;
+  const now=performance.now(),el=now-lastT; lastT=now;
   fpsS=fpsS*0.95+(1000/el)*0.05;
   if(frame%30===0) document.getElementById('fps').textContent=fpsS.toFixed(0)+' fps';
   requestAnimationFrame(loop);
