@@ -201,7 +201,7 @@ void main(){
   for(int iy=0;iy<4;iy++)
     for(int ix=0;ix<4;ix++)
       v+=sampleAt(w+vec2((float(ix)-1.5)*step,(float(iy)-1.5)*step));
-  v = max(v/16.0, vec3(0.001));
+  v = clamp(v/16.0, vec3(0.001), vec3(100.0));
   fragColor=vec4(v, 1.0);
 }`);
 
@@ -211,9 +211,12 @@ precision highp float;
 in vec2 uv; out vec4 fragColor;
 uniform sampler2D uD;
 uniform vec3 uS; // per-channel scale
+uniform vec3 uBoost; // add this when channel is dying
 void main(){
-  vec3 v = texture(uD,uv).rgb * uS;
-  fragColor=vec4(max(v, vec3(0.001)), 1.0);
+  vec3 v = texture(uD,uv).rgb * uS + uBoost;
+  // Clamp to prevent infinity propagation
+  v = clamp(v, vec3(0.001), vec3(100.0));
+  fragColor=vec4(v, 1.0);
 }`);
 
 // Display: log-scale each channel independently, then show as RGB
@@ -289,17 +292,23 @@ function doIter(ang){
     sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; cnt++;
   }
 
+  // Guard against NaN/Infinity in samples
+  for(let c=0;c<3;c++) if(!isFinite(sums[c])) { resetImage(); pp=1-pp; return; }
+
   // If all dead, reset
   if(sums[0]+sums[1]+sums[2] < 0.001*cnt){ resetImage(); pp=1-pp; return; }
 
   // Smoothly track the scale factor — never jump, just nudge
   for(let c=0;c<3;c++){
     const avg = sums[c]/cnt;
-    const desired = avg > 1e-10 ? 0.5/avg : 1.0;
+    if(!isFinite(avg)) { resetImage(); pp=1-pp; return; }
+    const desired = avg > 1e-10 ? Math.min(0.5/avg, 10.0) : 1.0;
     // Blend toward desired scale, slowly
     runAvg[c] = runAvg[c]*0.98 + desired*0.02;
   }
   const sc = new Float32Array([runAvg[0], runAvg[1], runAvg[2]]);
+
+  const boost = new Float32Array(3); // no boost
 
   gl.bindFramebuffer(gl.FRAMEBUFFER,wFBO);
   gl.viewport(0,0,SIZE,SIZE);
@@ -308,6 +317,7 @@ function doIter(ang){
   gl.bindTexture(gl.TEXTURE_2D,texC);
   gl.uniform1i(gl.getUniformLocation(normProg,'uD'),0);
   gl.uniform3fv(gl.getUniformLocation(normProg,'uS'),sc);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uBoost'),boost);
   drawQ(normProg);
   pp=1-pp;
 }
@@ -360,6 +370,17 @@ function loop(){
   for(let i=0;i<60;i++) ang[i]=baseAngles[i]+phases[i];
   doIter(ang);
   display();
+  if(frame%100===0){
+    const rFBO=pp===0?fboA:fboB;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,rFBO);
+    const b=new Float32Array(4); let s=[0,0,0],n=0;
+    const st2=Math.floor(SIZE/8);
+    for(let y=0;y<SIZE;y+=st2)for(let x=0;x<SIZE;x+=st2){
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);s[0]+=b[0];s[1]+=b[1];s[2]+=b[2];n++;
+    }
+    console.log('frame '+frame+': avg R='+(s[0]/n).toExponential(2)+' G='+(s[1]/n).toExponential(2)+' B='+(s[2]/n).toExponential(2)+' runAvg=['+runAvg[0].toFixed(3)+','+runAvg[1].toFixed(3)+','+runAvg[2].toFixed(3)+']');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  }
   frame++;
   const now=performance.now(),el=now-lastT; lastT=now;
   fpsS=fpsS*0.95+(1000/el)*0.05;
