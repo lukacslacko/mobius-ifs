@@ -2,42 +2,28 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Möbius IFS — General</title>
+<title>Möbius IFS — Color</title>
 <style>
   * { margin: 0; padding: 0; }
   body { background: #000; overflow: hidden; font-family: monospace; }
   canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
   .controls {
     position: fixed; top: 10px; left: 10px; z-index: 10;
-    background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
-    color: #aaa; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+    background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 6px;
+    color: #aaa; font-size: 12px; display: flex; gap: 15px; align-items: center;
   }
-  .controls label { cursor: pointer; white-space: nowrap; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .controls input[type=range] { width: 90px; }
+  .controls label { cursor: pointer; white-space: nowrap; }
+  .controls input[type=range] { width: 100px; vertical-align: middle; }
   .controls select { background: #333; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 2px; }
-  #fps { text-align: right; }
+  #fps { min-width: 50px; }
 </style>
 </head>
 <body>
 <div class="controls">
-  <label>Funcs: <select id="nfuncs">
+  <label>Functions: <select id="nfuncs">
     <option value="1">1</option><option value="2">2</option>
     <option value="3" selected>3</option><option value="4">4</option>
     <option value="5">5</option><option value="6">6</option>
-  </select></label>
-  <label>Num°: <select id="numdeg">
-    <option value="0">0</option><option value="1">1</option>
-    <option value="2">2</option><option value="3" selected>3</option><option value="4">4</option>
-  </select></label>
-  <label>Den°: <select id="dendeg">
-    <option value="0">0</option><option value="1" selected>1</option>
-    <option value="2">2</option><option value="3">3</option><option value="4">4</option>
-  </select></label>
-  <label>Samples: <select id="nsamp">
-    <option value="6">6×6</option><option value="9">9×9</option>
-    <option value="12" selected>12×12</option><option value="15">15×15</option>
-    <option value="18">18×18</option><option value="21">21×21</option>
-    <option value="24">24×24</option>
   </select></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
@@ -112,38 +98,13 @@ const iterProg = pr(VS, `#version 300 es
 precision highp float;
 in vec2 uv; out vec4 fragColor;
 uniform sampler2D uD;
-uniform float a[60]; // up to 6 transforms × 10 coefficients
+uniform float a[24];
 uniform float sc;
 uniform float pixSize;
 uniform int nT;
-uniform float cw;
-uniform int numDeg; // numerator degree 0-4
-uniform int denDeg; // denominator degree 0-4
+uniform float cw; // color weight (boost for assigned channel)
 
 vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
-
-// Evaluate polynomial of degree deg with coefficients starting at a[off]
-// p(w) = c0·w^deg + c1·w^(deg-1) + ... + c_deg  (Horner's method)
-vec2 evalPoly(vec2 w, int off, int deg) {
-  vec2 r = vec2(cos(a[off]), sin(a[off]));
-  for (int k=1; k<=4; k++) {
-    if (k > deg) break;
-    r = cm(r, w) + vec2(cos(a[off+k]), sin(a[off+k]));
-  }
-  return r;
-}
-
-// Derivative of polynomial: p'(w) = deg·c0·w^(deg-1) + (deg-1)·c1·w^(deg-2) + ...
-vec2 evalPolyDeriv(vec2 w, int off, int deg) {
-  if (deg == 0) return vec2(0.0);
-  // Horner for derivative coefficients
-  vec2 r = vec2(cos(a[off]), sin(a[off])) * float(deg);
-  for (int k=1; k<=3; k++) {
-    if (k >= deg) break;
-    r = cm(r, w) + vec2(cos(a[off+k]), sin(a[off+k])) * float(deg - k);
-  }
-  return r;
-}
 
 vec3 colorWeight(int t) {
   if(t==0) return vec3(cw, 1.0, 1.0);
@@ -157,34 +118,26 @@ vec3 colorWeight(int t) {
 vec3 sampleAt(vec2 w){
   float R2 = sc*sc*0.25;
   if(dot(w,w) > R2) return vec3(0.0);
-  int nCoeffs = numDeg + 1 + denDeg + 1; // per transform
   vec3 acc = vec3(0.0);
   vec3 wTotal = vec3(0.0);
   for(int t=0;t<6;t++){
     if(t>=nT) break;
-    int base = t * 10; // 10 slots per transform (max 5+5)
-    int numOff = base;
-    int denOff = base + numDeg + 1;
-
-    vec2 n = evalPoly(w, numOff, numDeg);
-    vec2 d = evalPoly(w, denOff, denDeg);
-    float ds = max(dot(d,d), 1e-10);
-    vec2 z = vec2(dot(n,d)/ds, (n.y*d.x - n.x*d.y)/ds);
-
-    // Jacobian: |f'|² = |n'd - nd'|² / |d|⁴
-    vec2 np = evalPolyDeriv(w, numOff, numDeg);
-    vec2 dp = evalPolyDeriv(w, denOff, denDeg);
-    vec2 deriv_num = cm(np,d) - cm(n,dp);
-    float j = min(dot(deriv_num,deriv_num) / (ds*ds), 10.0);
-
+    vec2 A=vec2(cos(a[t*4]),sin(a[t*4])),B=vec2(cos(a[t*4+1]),sin(a[t*4+1])),
+         C=vec2(cos(a[t*4+2]),sin(a[t*4+2])),D=vec2(cos(a[t*4+3]),sin(a[t*4+3]));
+    vec2 n=cm(D,w)-B, d=-cm(C,w)+A;
+    float ds=max(dot(d,d),1e-10);
+    vec2 z=vec2(dot(n,d)/ds,(n.y*d.x-n.x*d.y)/ds);
+    vec2 ad=cm(A,D),bc=cm(B,C),det=ad-bc;
+    float j=dot(det,det)/(ds*ds);
     if(dot(z,z) <= R2){
-      vec2 s = z/sc + 0.5;
-      vec3 sampled = texture(uD, s).rgb;
-      vec3 cwt = colorWeight(t);
-      acc += sampled * j * cwt;
-      wTotal += cwt;
+      vec2 s=z/sc+0.5;
+      vec3 sampled = texture(uD,s).rgb;
+      vec3 cw = colorWeight(t);
+      acc += sampled * j * cw;
+      wTotal += cw;
     }
   }
+  // Normalize each channel by its total weight
   return vec3(
     wTotal.r > 0.0 ? acc.r / wTotal.r : 0.0,
     wTotal.g > 0.0 ? acc.g / wTotal.g : 0.0,
@@ -235,13 +188,12 @@ void main(){
 }`);
 
 const rng=(function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
-const baseAngles=new Float32Array(60), vels=new Float32Array(60);
-for(let i=0;i<60;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
+const baseAngles=new Float32Array(24), vels=new Float32Array(24);
+for(let i=0;i<24;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
 
 let nFuncs=3, pp=0, frame=0, lastT=performance.now(), fpsS=0;
 const logMax=new Float32Array([1,1,1]);
-const phases=new Float32Array(60);
-const runAvg=[1,1,1]; // smoothed running average per channel
+const phases=new Float32Array(24);
 
 function drawQ(p){
   const a=gl.getAttribLocation(p,'pos');
@@ -252,7 +204,7 @@ function drawQ(p){
 }
 
 function resetImage(){
-  frame=0; runAvg[0]=1; runAvg[1]=1; runAvg[2]=1;
+  frame=0;
   const d=new Float32Array(SIZE*SIZE*4);
   for(let i=0;i<SIZE*SIZE;i++){d[i*4]=1;d[i*4+1]=1;d[i*4+2]=1;d[i*4+3]=1;}
   for(const t of[texA,texB,texC]){
@@ -275,31 +227,26 @@ function doIter(ang){
   gl.uniform1f(gl.getUniformLocation(iterProg,'pixSize'),1.0/SIZE);
   gl.uniform1i(gl.getUniformLocation(iterProg,'nT'),nFuncs);
   gl.uniform1f(gl.getUniformLocation(iterProg,'cw'),document.getElementById('colorwt').value/100.0);
-  gl.uniform1i(gl.getUniformLocation(iterProg,'numDeg'),parseInt(document.getElementById('numdeg').value));
-  gl.uniform1i(gl.getUniformLocation(iterProg,'denDeg'),parseInt(document.getElementById('dendeg').value));
   drawQ(iterProg);
 
-  // Fast per-channel normalization: few samples, smoothed tracking
+  // Sample for per-channel normalization
   const buf=new Float32Array(4);
-  let sums=[0,0,0], cnt=0;
-  const ns=parseInt(document.getElementById('nsamp').value);
-  const st=Math.floor(SIZE/ns);
+  let sums=[0,0,0], n=0;
+  const st=Math.floor(SIZE/16);
   for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
     gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,buf);
-    sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; cnt++;
+    sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; n++;
   }
+  const avgs=[sums[0]/n, sums[1]/n, sums[2]/n];
 
-  // If all dead, reset
-  if(sums[0]+sums[1]+sums[2] < 0.001*cnt){ resetImage(); pp=1-pp; return; }
+  // If any channel collapsed, reset
+  if(avgs[0]<0.0001 && avgs[1]<0.0001 && avgs[2]<0.0001){ resetImage(); pp=1-pp; return; }
 
-  // Smoothly track the scale factor — never jump, just nudge
-  for(let c=0;c<3;c++){
-    const avg = sums[c]/cnt;
-    const desired = avg > 1e-10 ? 0.5/avg : 1.0;
-    // Blend toward desired scale, slowly
-    runAvg[c] = runAvg[c]*0.98 + desired*0.02;
-  }
-  const sc = new Float32Array([runAvg[0], runAvg[1], runAvg[2]]);
+  const sc = new Float32Array([
+    avgs[0]>1e-10 ? Math.min(Math.max(1.0/avgs[0],0.5),1.5) : 1.0,
+    avgs[1]>1e-10 ? Math.min(Math.max(1.0/avgs[1],0.5),1.5) : 1.0,
+    avgs[2]>1e-10 ? Math.min(Math.max(1.0/avgs[2],0.5),1.5) : 1.0,
+  ]);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER,wFBO);
   gl.viewport(0,0,SIZE,SIZE);
@@ -343,21 +290,19 @@ function display(){
 }
 
 document.getElementById('randomize').addEventListener('click', function(){
-  for(let i=0;i<60;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
+  for(let i=0;i<24;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
   resetImage();
 });
 document.getElementById('nfuncs').addEventListener('change', function(){
   nFuncs=parseInt(this.value); resetImage();
 });
-document.getElementById('numdeg').addEventListener('change', function(){ resetImage(); });
-document.getElementById('dendeg').addEventListener('change', function(){ resetImage(); });
 
 function loop(){
   const speedPct=document.getElementById('speed').value/100.0;
   const dt=1.0/60.0;
-  for(let i=0;i<60;i++) phases[i]+=vels[i]*dt*speedPct;
-  const ang=new Float32Array(60);
-  for(let i=0;i<60;i++) ang[i]=baseAngles[i]+phases[i];
+  for(let i=0;i<24;i++) phases[i]+=vels[i]*dt*speedPct;
+  const ang=new Float32Array(24);
+  for(let i=0;i<24;i++) ang[i]=baseAngles[i]+phases[i];
   doIter(ang);
   display();
   frame++;
