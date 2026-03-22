@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Entity IFS</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; font-family: monospace; }
+  canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .controls {
+    position: fixed; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
+    color: #aaa; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .controls label { cursor: pointer; white-space: nowrap; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .controls input[type=range] { width: 90px; }
+  #fps { text-align: right; }
+</style>
+</head>
+<body>
+<div class="controls">
+  <label>Speed: <input type="range" id="speed" min="0" max="200" value="50"></label>
+  <label>Radius: <input type="range" id="radius" min="2" max="40" value="10"></label>
+  <button id="randomize">Randomize</button>
+  <span id="fps"></span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+function resize() {
+  const s = Math.min(window.innerWidth, window.innerHeight);
+  canvas.width = s; canvas.height = s;
+  canvas.style.width = s + 'px'; canvas.style.height = s + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+const gl = canvas.getContext('webgl2');
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+
+const SIZE = canvas.width;
+const SCALE = 4.0;
+
+function makeTex() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFBO(t) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return f;
+}
+
+const init = new Float32Array(SIZE * SIZE * 4);
+for (let i = 0; i < SIZE * SIZE; i++) { init[i*4]=1; init[i*4+1]=1; init[i*4+2]=1; init[i*4+3]=1; }
+
+const texA = makeTex(), texB = makeTex(), texC = makeTex();
+for (const t of [texA, texB, texC]) {
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, init);
+}
+const fboA = makeFBO(texA), fboB = makeFBO(texB), fboC = makeFBO(texC);
+
+const qb = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+function sh(s, t) {
+  const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+  if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o;
+}
+function pr(v, f) {
+  const p = gl.createProgram(); gl.attachShader(p, sh(v, gl.VERTEX_SHADER));
+  gl.attachShader(p, sh(f, gl.FRAGMENT_SHADER)); gl.linkProgram(p); return p;
+}
+
+const VS = `#version 300 es
+in vec2 pos; out vec2 uv;
+void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0, 1); }`;
+
+// Iteration: 5 entities, each copies self (white) + 3 look-at (R,G,B)
+// Copy uses radial distortion: contracts near center, identity at R0, expands outside
+// Backward map: r -> R0 * sqrt(r/R0), plus twist
+const iterProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform vec2 ePos[5];   // entity self positions (world coords)
+uniform vec2 lPos[15];  // look-at positions: 5 entities x 3 (world coords)
+uniform float tw[5];    // twist factor per entity
+uniform float sc;       // world scale
+uniform float R0;       // identity radius
+
+void main() {
+  vec2 w = (uv - 0.5) * sc;
+  float R2 = sc * sc * 0.25;
+  if (dot(w, w) > R2) { fragColor = vec4(0.001, 0.001, 0.001, 1); return; }
+
+  // Identity pass-through: 80% of old density survives
+  vec3 acc = texture(uD, uv).rgb * 0.80;
+
+  for (int e = 0; e < 5; e++) {
+    vec2 S = ePos[e];
+
+    for (int c = 0; c < 4; c++) {
+      // c=0: self (white), c=1: red, c=2: green, c=3: blue
+      vec2 L = (c == 0) ? S : lPos[e * 3 + c - 1];
+
+      vec2 wp = w - S;
+      float r = max(length(wp), 0.001);
+      vec2 dir = wp / r;
+
+      // Backward radial map: r -> R0 * sqrt(r / R0) = sqrt(R0 * r)
+      // This expands near center (reads wider area -> condensation)
+      // and contracts far away (reads narrower -> dispersion)
+      float rr = R0 * sqrt(r / R0);
+
+      // Twist: rotate by angle proportional to distance
+      float ta = tw[e] * r;
+      float ct = cos(ta), st = sin(ta);
+      dir = vec2(ct * dir.x - st * dir.y, st * dir.x + ct * dir.y);
+
+      vec2 z = dir * rr + L;
+
+      // 2D Jacobian: f'(r) * f(r) / r = 0.5 * R0 / r
+      // High near entity (intensification), low far away (dispersion)
+      float j = min(0.5 * R0 / r, 10.0);
+
+      // Bounds check
+      if (dot(z, z) > R2) continue;
+      vec2 suv = z / sc + 0.5;
+      vec3 s = texture(uD, suv).rgb;
+
+      // 2% copy: self=white (all channels), others=single channel
+      if (c == 0) {
+        acc += s * j * 0.02;
+      } else if (c == 1) {
+        acc.r += s.r * j * 0.02;
+      } else if (c == 2) {
+        acc.g += s.g * j * 0.02;
+      } else {
+        acc.b += s.b * j * 0.02;
+      }
+    }
+  }
+
+  acc = clamp(acc, vec3(0.001), vec3(100.0));
+  fragColor = vec4(acc, 1.0);
+}`);
+
+// Normalization: scale each channel to maintain avg ~1
+const normProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform vec3 uS;
+void main() {
+  vec3 v = texture(uD, uv).rgb * uS;
+  v = clamp(v, vec3(0.001), vec3(100.0));
+  fragColor = vec4(v, 1.0);
+}`);
+
+// Display: log-scale each channel, gamma correct
+const dispProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform vec3 uLM;
+uniform float uG;
+void main() {
+  vec2 c = uv - 0.5;
+  if (dot(c, c) > 0.25) { fragColor = vec4(0, 0, 0, 1); return; }
+  vec3 d = texture(uD, uv).rgb;
+  vec3 v;
+  v.r = uLM.r > 0.001 ? pow(clamp(log(1.0 + abs(d.r)) / uLM.r, 0.0, 1.0), uG) : 0.0;
+  v.g = uLM.g > 0.001 ? pow(clamp(log(1.0 + abs(d.g)) / uLM.g, 0.0, 1.0), uG) : 0.0;
+  v.b = uLM.b > 0.001 ? pow(clamp(log(1.0 + abs(d.b)) / uLM.b, 0.0, 1.0), uG) : 0.0;
+  fragColor = vec4(v, 1);
+}`);
+
+/* ── Entity state ── */
+const NUM_E = 5;
+const entities = [];
+
+function initEntities() {
+  entities.length = 0;
+  for (let i = 0; i < NUM_E; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 0.3 + Math.random() * 0.5;
+    const e = {
+      x: Math.cos(ang) * dist,
+      y: Math.sin(ang) * dist,
+      lookAt: [],
+      twist: (Math.random() - 0.5) * 20,
+      twistVel: (Math.random() - 0.5) * 2,
+    };
+    for (let j = 0; j < 3; j++) {
+      const la = Math.random() * Math.PI * 2;
+      const ld = 0.2 + Math.random() * 1.0;
+      e.lookAt.push({ x: Math.cos(la) * ld, y: Math.sin(la) * ld });
+    }
+    entities.push(e);
+  }
+}
+initEntities();
+
+let pp = 0, frame = 0, lastT = performance.now(), fpsS = 0;
+const logMax = new Float32Array([1, 1, 1]);
+const runAvg = [1, 1, 1];
+
+function drawQ(p) {
+  const a = gl.getAttribLocation(p, 'pos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.enableVertexAttribArray(a);
+  gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function resetImage() {
+  frame = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
+  const d = new Float32Array(SIZE * SIZE * 4);
+  for (let i = 0; i < SIZE * SIZE; i++) { d[i*4]=1; d[i*4+1]=1; d[i*4+2]=1; d[i*4+3]=1; }
+  for (const t of [texA, texB, texC]) {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, d);
+  }
+  logMax[0] = 1; logMax[1] = 1; logMax[2] = 1;
+}
+
+function clampToWorld(p, maxR) {
+  const r = Math.sqrt(p.x * p.x + p.y * p.y);
+  if (r > maxR) { p.x *= maxR / r; p.y *= maxR / r; }
+}
+
+function updateEntities(dt) {
+  const speedPct = document.getElementById('speed').value / 100.0;
+  const m = dt * speedPct;
+
+  for (const e of entities) {
+    // Random walk
+    e.x += (Math.random() - 0.5) * 0.04 * m;
+    e.y += (Math.random() - 0.5) * 0.04 * m;
+
+    // Bias toward distance 0.5 from center
+    const r = Math.sqrt(e.x * e.x + e.y * e.y);
+    if (r > 0.01) {
+      const bias = (0.5 - r) * 0.01 * m;
+      e.x += (e.x / r) * bias;
+      e.y += (e.y / r) * bias;
+    }
+    clampToWorld(e, 1.7);
+
+    // Look-at points: random walk with gentle center bias
+    for (const la of e.lookAt) {
+      la.x += (Math.random() - 0.5) * 0.06 * m;
+      la.y += (Math.random() - 0.5) * 0.06 * m;
+      la.x *= 1.0 - 0.002 * m;
+      la.y *= 1.0 - 0.002 * m;
+      clampToWorld(la, 1.7);
+    }
+
+    // Slowly evolving twist
+    e.twist += e.twistVel * dt * speedPct;
+    e.twistVel += (Math.random() - 0.5) * 0.1;
+    e.twistVel *= 0.99;
+  }
+}
+
+function doIter() {
+  const rT = pp === 0 ? texA : texB, wFBO = pp === 0 ? fboB : fboA;
+
+  // -- Iteration pass --
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboC);
+  gl.viewport(0, 0, SIZE, SIZE);
+  gl.useProgram(iterProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, rT);
+  gl.uniform1i(gl.getUniformLocation(iterProg, 'uD'), 0);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'sc'), SCALE);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'R0'),
+    document.getElementById('radius').value / 100.0);
+
+  // Pack entity data
+  const ePos = new Float32Array(10);
+  const lPos = new Float32Array(30);
+  const tw = new Float32Array(5);
+  for (let i = 0; i < NUM_E; i++) {
+    ePos[i * 2]     = entities[i].x;
+    ePos[i * 2 + 1] = entities[i].y;
+    for (let j = 0; j < 3; j++) {
+      lPos[i * 6 + j * 2]     = entities[i].lookAt[j].x;
+      lPos[i * 6 + j * 2 + 1] = entities[i].lookAt[j].y;
+    }
+    tw[i] = entities[i].twist;
+  }
+  gl.uniform2fv(gl.getUniformLocation(iterProg, 'ePos'), ePos);
+  gl.uniform2fv(gl.getUniformLocation(iterProg, 'lPos'), lPos);
+  gl.uniform1fv(gl.getUniformLocation(iterProg, 'tw'), tw);
+  drawQ(iterProg);
+
+  // -- Normalization sampling --
+  const buf = new Float32Array(4);
+  let sums = [0, 0, 0], cnt = 0;
+  const ns = 12;
+  const st = Math.floor(SIZE / ns);
+  for (let y = 0; y < SIZE; y += st)
+    for (let x = 0; x < SIZE; x += st) {
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, buf);
+      sums[0] += buf[0]; sums[1] += buf[1]; sums[2] += buf[2]; cnt++;
+    }
+
+  for (let c = 0; c < 3; c++)
+    if (!isFinite(sums[c])) { resetImage(); pp = 1 - pp; return; }
+  if (sums[0] + sums[1] + sums[2] < 0.001 * cnt) { resetImage(); pp = 1 - pp; return; }
+
+  for (let c = 0; c < 3; c++) {
+    const avg = sums[c] / cnt;
+    if (!isFinite(avg)) { resetImage(); pp = 1 - pp; return; }
+    const desired = avg > 1e-10 ? Math.min(0.5 / avg, 10.0) : 1.0;
+    runAvg[c] = runAvg[c] * 0.98 + desired * 0.02;
+  }
+  const sc = new Float32Array([runAvg[0], runAvg[1], runAvg[2]]);
+
+  // -- Normalization pass --
+  gl.bindFramebuffer(gl.FRAMEBUFFER, wFBO);
+  gl.viewport(0, 0, SIZE, SIZE);
+  gl.useProgram(normProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texC);
+  gl.uniform1i(gl.getUniformLocation(normProg, 'uD'), 0);
+  gl.uniform3fv(gl.getUniformLocation(normProg, 'uS'), sc);
+  drawQ(normProg);
+  pp = 1 - pp;
+}
+
+function display() {
+  const rFBO = pp === 0 ? fboA : fboB;
+  if (frame % 10 === 0) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, rFBO);
+    const b = new Float32Array(4);
+    let mx = [0, 0, 0];
+    const st = Math.floor(SIZE / 8);
+    for (let y = 0; y < SIZE; y += st)
+      for (let x = 0; x < SIZE; x += st) {
+        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, b);
+        mx[0] = Math.max(mx[0], Math.abs(b[0]));
+        mx[1] = Math.max(mx[1], Math.abs(b[1]));
+        mx[2] = Math.max(mx[2], Math.abs(b[2]));
+      }
+    for (let c = 0; c < 3; c++) {
+      const nl = Math.log(1 + mx[c]);
+      logMax[c] = logMax[c] * 0.8 + nl * 0.2;
+      if (logMax[c] < 0.01) logMax[c] = 0.01;
+    }
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, pp === 0 ? texA : texB);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'uD'), 0);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uLM'), logMax);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uG'), 0.45);
+  drawQ(dispProg);
+}
+
+document.getElementById('randomize').addEventListener('click', function () {
+  initEntities();
+  resetImage();
+});
+
+function loop() {
+  const dt = 1.0 / 60.0;
+  updateEntities(dt);
+  doIter();
+  display();
+  frame++;
+  const now = performance.now(), el = now - lastT; lastT = now;
+  fpsS = fpsS * 0.95 + (1000 / el) * 0.05;
+  if (frame % 30 === 0) document.getElementById('fps').textContent = fpsS.toFixed(0) + ' fps';
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
