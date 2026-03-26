@@ -27,8 +27,8 @@
   </select></label>
   <label>Fill: <select id="fillmode">
     <option value="0">Nothing</option>
-    <option value="1">Contracted</option>
-    <option value="2" selected>Inverted</option>
+    <option value="1" selected>Contracted</option>
+    <option value="2">Inverted</option>
   </select></label>
   <label>Deg: <select id="deg">
     <option value="1" selected>1</option><option value="2">2</option>
@@ -42,6 +42,7 @@
     <option value="24">24&times;24</option>
   </select></label>
   <label>Bias: <input type="range" id="bias" min="0" max="200" value="100"></label>
+  <label>Hole: <input type="range" id="holemul" min="0" max="200" value="100"></label>
   <label>Twist: <input type="range" id="twistmul" min="0" max="100" value="100"></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
@@ -124,6 +125,7 @@ uniform int fillMode; // 0=nothing, 1=contracted, 2=inverted
 uniform int deg;      // complex power degree applied inside hole fills
 uniform float bias;     // radial exponent: >1 concentrates toward hole, <1 toward boundary
 uniform float twistMul; // multiplier on twist parameter (0=no twist, 1=full)
+uniform float holeMul;  // multiplier on hole radius (0.25-4.0, log scale)
 
 // Complex multiply
 vec2 cm(vec2 a, vec2 b){ return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
@@ -150,7 +152,7 @@ vec4 blowupBack(vec2 w, int t){
   // Extract animated parameters
   vec2 p = vec2(0.5*sin(a[b]), 0.5*sin(a[b+1]));
   vec2 c = vec2(0.5*sin(a[b+2]), 0.5*sin(a[b+3]));
-  float rho = 0.08 + 0.22*(0.5 + 0.5*sin(a[b+4]));
+  float rho = clamp((0.08 + 0.22*(0.5 + 0.5*sin(a[b+4]))) * holeMul, 0.02, 0.8);
   float twist = 2.0*sin(a[b+5]) * twistMul;
   float rot = a[b+6];
 
@@ -345,6 +347,7 @@ function doIter(ang){
   gl.uniform1i(gl.getUniformLocation(iterProg,'deg'),parseInt(document.getElementById('deg').value));
   gl.uniform1f(gl.getUniformLocation(iterProg,'bias'),Math.pow(10, document.getElementById('bias').value/100.0 - 1.0));
   gl.uniform1f(gl.getUniformLocation(iterProg,'twistMul'),document.getElementById('twistmul').value/100.0);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'holeMul'),Math.pow(2, document.getElementById('holemul').value/50.0 - 2.0));
   drawQ(iterProg);
 
   // Normalization sampling
