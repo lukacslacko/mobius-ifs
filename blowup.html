@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Möbius IFS — Blowup</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; font-family: monospace; }
+  canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .controls {
+    position: fixed; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
+    color: #aaa; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .controls label { cursor: pointer; white-space: nowrap; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .controls input[type=range] { width: 90px; }
+  .controls select { background: #333; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 2px; }
+  #fps { text-align: right; }
+</style>
+</head>
+<body>
+<div class="controls">
+  <label>Funcs: <select id="nfuncs">
+    <option value="1">1</option><option value="2">2</option>
+    <option value="3" selected>3</option><option value="4">4</option>
+    <option value="5">5</option><option value="6">6</option>
+  </select></label>
+  <label>Fill: <select id="fillmode">
+    <option value="0">Nothing</option>
+    <option value="1">Contracted</option>
+    <option value="2" selected>Inverted</option>
+  </select></label>
+  <label>Deg: <select id="deg">
+    <option value="1" selected>1</option><option value="2">2</option>
+    <option value="3">3</option><option value="4">4</option>
+    <option value="5">5</option>
+  </select></label>
+  <label>Samples: <select id="nsamp">
+    <option value="6">6&times;6</option><option value="9">9&times;9</option>
+    <option value="12" selected>12&times;12</option><option value="15">15&times;15</option>
+    <option value="18">18&times;18</option><option value="21">21&times;21</option>
+    <option value="24">24&times;24</option>
+  </select></label>
+  <label>Bias: <input type="range" id="bias" min="0" max="200" value="100"></label>
+  <label>Twist: <input type="range" id="twistmul" min="0" max="100" value="100"></label>
+  <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
+  <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
+  <button id="randomize">Randomize</button>
+  <span id="fps"></span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+function resize() {
+  const s = Math.min(window.innerWidth, window.innerHeight);
+  canvas.width = s; canvas.height = s;
+  canvas.style.width = s + 'px'; canvas.style.height = s + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+const gl = canvas.getContext('webgl2');
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+
+const SIZE = canvas.width;
+const SCALE = 4.0;
+
+function makeTex() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFBO(t) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return f;
+}
+
+const init = new Float32Array(SIZE*SIZE*4);
+for (let i = 0; i < SIZE*SIZE; i++) { init[i*4]=1; init[i*4+1]=1; init[i*4+2]=1; init[i*4+3]=1; }
+
+const texA=makeTex(), texB=makeTex(), texC=makeTex();
+for (const t of [texA,texB,texC]) {
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, init);
+}
+const fboA=makeFBO(texA), fboB=makeFBO(texB), fboC=makeFBO(texC);
+
+const qb=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+function sh(s,t){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+  if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o;}
+function pr(v,f){const p=gl.createProgram();gl.attachShader(p,sh(v,gl.VERTEX_SHADER));
+  gl.attachShader(p,sh(f,gl.FRAGMENT_SHADER));gl.linkProgram(p);return p;}
+
+const VS=`#version 300 es
+in vec2 pos; out vec2 uv;
+void main(){uv=pos*0.5+0.5;gl_Position=vec4(pos,0,1);}`;
+
+// Blowup IFS iteration shader
+// Each transform blows up a puncture point into a disk-shaped hole.
+// Backward map: z = M_p^{-1}( collapse( M_c(w) ) )
+// where M_c centers the hole at origin, collapse shrinks the annulus
+// to a punctured disk, and M_p^{-1} sends origin to the puncture point.
+const iterProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform float a[48]; // 8 per transform, up to 6
+uniform float sc;
+uniform float pixSize;
+uniform int nT;
+uniform float cw;
+uniform int fillMode; // 0=nothing, 1=contracted, 2=inverted
+uniform int deg;      // complex power degree applied inside hole fills
+uniform float bias;     // radial exponent: >1 concentrates toward hole, <1 toward boundary
+uniform float twistMul; // multiplier on twist parameter (0=no twist, 1=full)
+
+// Complex multiply
+vec2 cm(vec2 a, vec2 b){ return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
+// Complex conjugate
+vec2 cc(vec2 a){ return vec2(a.x, -a.y); }
+// Complex divide a/b
+vec2 cd(vec2 a, vec2 b){ float d=dot(b,b); return vec2(dot(a,b), a.y*b.x-a.x*b.y)/max(d,1e-10); }
+
+vec3 colorWeight(int t){
+  if(t==0) return vec3(cw,1.0,1.0);
+  if(t==1) return vec3(1.0,cw,1.0);
+  if(t==2) return vec3(1.0,1.0,cw);
+  if(t==3) return vec3(cw,cw,1.0);
+  if(t==4) return vec3(cw,1.0,cw);
+  return vec3(1.0,cw,cw);
+}
+
+// Blowup backward map for one transform.
+// w is in unit-disk coords (|w| < 1).
+// Returns vec4(z.x, z.y, jacobian, valid). valid < 0 means skip.
+vec4 blowupBack(vec2 w, int t){
+  int b = t * 8;
+
+  // Extract animated parameters
+  vec2 p = vec2(0.5*sin(a[b]), 0.5*sin(a[b+1]));
+  vec2 c = vec2(0.5*sin(a[b+2]), 0.5*sin(a[b+3]));
+  float rho = 0.08 + 0.22*(0.5 + 0.5*sin(a[b+4]));
+  float twist = 2.0*sin(a[b+5]) * twistMul;
+  float rot = a[b+6];
+
+  // Step 1: M_c(w) = (w - c) / (1 - conj(c)*w)
+  vec2 one = vec2(1.0, 0.0);
+  vec2 den_c = one - cm(cc(c), w);
+  float den_c2 = dot(den_c, den_c);
+  vec2 u = cd(w - c, den_c);
+  float r = length(u);
+
+  // |M_c'(w)|^2 = (1 - |c|^2)^2 / |1 - c_bar*w|^4
+  float c2 = dot(c, c);
+  float j_mc = (1.0 - c2)*(1.0 - c2) / max(den_c2*den_c2, 1e-20);
+
+  vec2 v;
+  float j_rad;
+
+  if(r >= rho){
+    // Annular region: collapse with radial bias
+    // t maps [rho,1] -> [0,1] linearly, then R = t^bias
+    float t = (r - rho) / (1.0 - rho);
+    float R = pow(max(t, 1e-10), bias);
+    float th = atan(u.y, u.x) + twist*log(r/rho) + rot;
+    v = R * vec2(cos(th), sin(th));
+    // Jacobian of purely-radial power: bias * t^(2*bias-1) / (r * (1-rho))
+    j_rad = bias * pow(max(t, 1e-10), 2.0*bias - 1.0) / (r * (1.0 - rho));
+  } else if(fillMode == 0){
+    // Nothing: no contribution from inside the hole
+    return vec4(0.0, 0.0, 0.0, -1.0);
+  } else if(fillMode == 1){
+    // Contracted: scale hole to unit disk, apply radial bias, then z^deg
+    float s = r / rho;
+    float R1 = pow(max(s, 1e-10), bias);  // radial bias
+    float th1 = atan(u.y, u.x) + rot;
+    // Complex power: (R1, th1) -> (R1^deg, th1*deg)
+    float Rn = pow(R1, float(deg));
+    float thn = th1 * float(deg);
+    v = Rn * vec2(cos(thn), sin(thn));
+    // Jacobian: scaling(1/rho²) * radial_bias(bias*s^(2*(bias-1))) * degree(deg²*R1^(2*(deg-1)))
+    j_rad = bias * pow(max(s, 1e-10), 2.0*(bias-1.0)) / (rho*rho)
+          * float(deg*deg) * pow(max(R1, 1e-10), 2.0*float(deg-1));
+  } else {
+    // Inverted: circle inversion in |u|=rho, then collapse
+    // Inversion: r -> rho^2/r (maps hole interior to annular exterior)
+    float ri = rho*rho / max(r, 1e-6);
+    // Discard if inverted point falls outside unit disk
+    if(ri >= 1.0) return vec4(0.0, 0.0, 0.0, -1.0);
+    // Collapse the inverted point with bias, then apply z^deg
+    float ti = (ri - rho) / (1.0 - rho);
+    float R1 = pow(max(ti, 1e-10), bias);  // radial bias
+    float th1 = atan(u.y, u.x) + twist*log(ri/rho) + rot;
+    // Complex power: (R1, th1) -> (R1^deg, th1*deg)
+    float Rn = pow(R1, float(deg));
+    float thn = th1 * float(deg);
+    v = Rn * vec2(cos(thn), sin(thn));
+    // Jacobian: inversion * biased_collapse * power
+    float j_inv = pow(rho, 4.0) / max(pow(r, 4.0), 1e-20);
+    float j_col = bias * pow(max(ti, 1e-10), 2.0*bias - 1.0) / ((1.0 - rho) * ri);
+    float j_pow = float(deg*deg) * pow(max(R1, 1e-10), 2.0*float(deg-1));
+    j_rad = j_inv * j_col * j_pow;
+  }
+
+  // Step 3: M_p^{-1}(v) = (v + p) / (1 + conj(p)*v)
+  vec2 den_p = vec2(1.0, 0.0) + cm(cc(p), v);
+  float den_p2 = dot(den_p, den_p);
+  vec2 z = cd(v + p, den_p);
+
+  // |(M_p^{-1})'(v)|^2 = (1 - |p|^2)^2 / |1 + p_bar*v|^4
+  float p2 = dot(p, p);
+  float j_mp = (1.0 - p2)*(1.0 - p2) / max(den_p2*den_p2, 1e-20);
+
+  float j = j_mc * j_rad * j_mp;
+  return vec4(z, j, 1.0);
+}
+
+vec3 sampleAt(vec2 w){
+  float R2 = sc*sc*0.25;
+  if(dot(w,w)>R2) return vec3(0.0);
+  // Convert to unit-disk coords
+  vec2 wu = w * 2.0 / sc;
+
+  vec3 acc = vec3(0.0);
+  vec3 wTotal = vec3(0.0);
+  for(int t=0; t<6; t++){
+    if(t>=nT) break;
+    vec4 res = blowupBack(wu, t);
+    if(res.w < 0.0) continue;
+    vec2 z = res.xy;
+    float j = min(res.z, 10.0);
+    if(dot(z,z) > 1.0) continue;
+    // Convert unit-disk coords to texture coords
+    vec2 s = z*0.5 + 0.5;
+    vec3 sampled = texture(uD, s).rgb;
+    vec3 cwt = colorWeight(t);
+    acc += sampled * j * cwt;
+    wTotal += cwt;
+  }
+  return vec3(
+    wTotal.r>0.0 ? acc.r/wTotal.r : 0.0,
+    wTotal.g>0.0 ? acc.g/wTotal.g : 0.0,
+    wTotal.b>0.0 ? acc.b/wTotal.b : 0.0
+  );
+}
+
+void main(){
+  vec2 w = (uv - 0.5)*sc;
+  float R2 = sc*sc*0.25;
+  if(dot(w,w)>R2){ fragColor=vec4(0.001,0.001,0.001,1); return; }
+  float step = pixSize*sc/4.0;
+  vec3 v = vec3(0.0);
+  for(int iy=0; iy<4; iy++)
+    for(int ix=0; ix<4; ix++)
+      v += sampleAt(w + vec2((float(ix)-1.5)*step, (float(iy)-1.5)*step));
+  v = clamp(v/16.0, vec3(0.001), vec3(100.0));
+  fragColor = vec4(v, 1.0);
+}`);
+
+// Normalization: scale each channel independently to avg~1
+const normProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform vec3 uS;
+uniform vec3 uBoost;
+void main(){
+  vec3 v = texture(uD,uv).rgb * uS + uBoost;
+  v = clamp(v, vec3(0.001), vec3(100.0));
+  fragColor=vec4(v, 1.0);
+}`);
+
+// Display: log-scale each channel, gamma correct
+const dispProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uD;
+uniform vec3 uLM;
+uniform float uG;
+void main(){
+  vec2 c = uv - 0.5;
+  if(dot(c,c)>0.25){ fragColor=vec4(0,0,0,1); return; }
+  vec3 d = texture(uD,uv).rgb;
+  vec3 v;
+  v.r = uLM.r>0.001 ? pow(clamp(log(1.0+abs(d.r))/uLM.r,0.0,1.0),uG) : 0.0;
+  v.g = uLM.g>0.001 ? pow(clamp(log(1.0+abs(d.g))/uLM.g,0.0,1.0),uG) : 0.0;
+  v.b = uLM.b>0.001 ? pow(clamp(log(1.0+abs(d.b))/uLM.b,0.0,1.0),uG) : 0.0;
+  fragColor=vec4(v,1);
+}`);
+
+const NPARAMS = 48;
+const rng=(function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
+const baseAngles=new Float32Array(NPARAMS), vels=new Float32Array(NPARAMS);
+for(let i=0;i<NPARAMS;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
+
+let nFuncs=3, pp=0, frame=0, lastT=performance.now(), fpsS=0;
+const logMax=new Float32Array([1,1,1]);
+const phases=new Float32Array(NPARAMS);
+const runAvg=[1,1,1];
+
+function drawQ(p){
+  const a=gl.getAttribLocation(p,'pos');
+  gl.bindBuffer(gl.ARRAY_BUFFER,qb);
+  gl.enableVertexAttribArray(a);
+  gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
+
+function resetImage(){
+  frame=0; runAvg[0]=1; runAvg[1]=1; runAvg[2]=1;
+  const d=new Float32Array(SIZE*SIZE*4);
+  for(let i=0;i<SIZE*SIZE;i++){d[i*4]=1;d[i*4+1]=1;d[i*4+2]=1;d[i*4+3]=1;}
+  for(const t of[texA,texB,texC]){
+    gl.bindTexture(gl.TEXTURE_2D,t);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIZE,SIZE,0,gl.RGBA,gl.FLOAT,d);
+  }
+  logMax[0]=1; logMax[1]=1; logMax[2]=1;
+}
+
+function doIter(ang){
+  const rT=pp===0?texA:texB, wFBO=pp===0?fboB:fboA;
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboC);
+  gl.viewport(0,0,SIZE,SIZE);
+  gl.useProgram(iterProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,rT);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uD'),0);
+  gl.uniform1fv(gl.getUniformLocation(iterProg,'a'),ang);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'sc'),SCALE);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'pixSize'),1.0/SIZE);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'nT'),nFuncs);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'cw'),document.getElementById('colorwt').value/100.0);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'fillMode'),parseInt(document.getElementById('fillmode').value));
+  gl.uniform1i(gl.getUniformLocation(iterProg,'deg'),parseInt(document.getElementById('deg').value));
+  gl.uniform1f(gl.getUniformLocation(iterProg,'bias'),Math.pow(10, document.getElementById('bias').value/100.0 - 1.0));
+  gl.uniform1f(gl.getUniformLocation(iterProg,'twistMul'),document.getElementById('twistmul').value/100.0);
+  drawQ(iterProg);
+
+  // Normalization sampling
+  const buf=new Float32Array(4);
+  let sums=[0,0,0], cnt=0;
+  const ns=parseInt(document.getElementById('nsamp').value);
+  const st=Math.floor(SIZE/ns);
+  for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,buf);
+    sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; cnt++;
+  }
+
+  for(let c=0;c<3;c++) if(!isFinite(sums[c])) { resetImage(); pp=1-pp; return; }
+  if(sums[0]+sums[1]+sums[2] < 0.001*cnt){ resetImage(); pp=1-pp; return; }
+
+  for(let c=0;c<3;c++){
+    const avg = sums[c]/cnt;
+    if(!isFinite(avg)) { resetImage(); pp=1-pp; return; }
+    const desired = avg > 1e-10 ? Math.min(0.5/avg, 10.0) : 1.0;
+    runAvg[c] = runAvg[c]*0.98 + desired*0.02;
+  }
+  const sc = new Float32Array([runAvg[0], runAvg[1], runAvg[2]]);
+  const boost = new Float32Array(3);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER,wFBO);
+  gl.viewport(0,0,SIZE,SIZE);
+  gl.useProgram(normProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,texC);
+  gl.uniform1i(gl.getUniformLocation(normProg,'uD'),0);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uS'),sc);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uBoost'),boost);
+  drawQ(normProg);
+  pp=1-pp;
+}
+
+function display(){
+  const rFBO=pp===0?fboA:fboB;
+  if(frame%10===0){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,rFBO);
+    const b=new Float32Array(4);
+    let mx=[0,0,0];
+    const st=Math.floor(SIZE/8);
+    for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);
+      mx[0]=Math.max(mx[0],Math.abs(b[0]));
+      mx[1]=Math.max(mx[1],Math.abs(b[1]));
+      mx[2]=Math.max(mx[2],Math.abs(b[2]));
+    }
+    for(let c=0;c<3;c++){
+      const nl=Math.log(1+mx[c]);
+      logMax[c]=logMax[c]*0.8+nl*0.2;
+      if(logMax[c]<0.01)logMax[c]=0.01;
+    }
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.useProgram(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,pp===0?texA:texB);
+  gl.uniform1i(gl.getUniformLocation(dispProg,'uD'),0);
+  gl.uniform3fv(gl.getUniformLocation(dispProg,'uLM'),logMax);
+  gl.uniform1f(gl.getUniformLocation(dispProg,'uG'),0.45);
+  drawQ(dispProg);
+}
+
+document.getElementById('randomize').addEventListener('click', function(){
+  for(let i=0;i<NPARAMS;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
+  resetImage();
+});
+document.getElementById('nfuncs').addEventListener('change', function(){
+  nFuncs=parseInt(this.value); resetImage();
+});
+document.getElementById('fillmode').addEventListener('change', function(){ resetImage(); });
+document.getElementById('deg').addEventListener('change', function(){ resetImage(); });
+
+function loop(){
+  const speedPct=document.getElementById('speed').value/100.0;
+  const dt=1.0/60.0;
+  for(let i=0;i<NPARAMS;i++) phases[i]+=vels[i]*dt*speedPct;
+  const ang=new Float32Array(NPARAMS);
+  for(let i=0;i<NPARAMS;i++) ang[i]=baseAngles[i]+phases[i];
+  doIter(ang);
+  display();
+  if(frame%100===0){
+    const rFBO=pp===0?fboA:fboB;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,rFBO);
+    const b=new Float32Array(4); let s=[0,0,0],n=0;
+    const st2=Math.floor(SIZE/8);
+    for(let y=0;y<SIZE;y+=st2)for(let x=0;x<SIZE;x+=st2){
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);s[0]+=b[0];s[1]+=b[1];s[2]+=b[2];n++;
+    }
+    console.log('frame '+frame+': avg R='+(s[0]/n).toExponential(2)+' G='+(s[1]/n).toExponential(2)+' B='+(s[2]/n).toExponential(2)+' runAvg=['+runAvg[0].toFixed(3)+','+runAvg[1].toFixed(3)+','+runAvg[2].toFixed(3)+']');
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  }
+  frame++;
+  const now=performance.now(),el=now-lastT; lastT=now;
+  fpsS=fpsS*0.95+(1000/el)*0.05;
+  if(frame%30===0) document.getElementById('fps').textContent=fpsS.toFixed(0)+' fps';
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
