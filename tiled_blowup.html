@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Möbius IFS — Tiled Blowup</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; font-family: monospace; }
+  canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .controls {
+    position: fixed; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
+    color: #aaa; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .controls label { cursor: pointer; white-space: nowrap; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .controls input[type=range] { width: 70px; }
+  .controls input[type=number] { width: 45px; background: #333; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 1px 3px; font-family: monospace; font-size: 11px; }
+  .controls select { background: #333; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 2px; }
+  #fps { text-align: right; }
+</style>
+</head>
+<body>
+<div class="controls">
+  <label>Tiles: <select id="ntiles">
+    <option value="2">2</option><option value="3">3</option>
+    <option value="4" selected>4</option><option value="5">5</option>
+    <option value="6">6</option><option value="7">7</option>
+    <option value="8">8</option><option value="9">9</option>
+    <option value="10">10</option><option value="12">12</option>
+    <option value="16">16</option><option value="20">20</option>
+    <option value="25">25</option><option value="36">36</option>
+    <option value="49">49</option><option value="64">64</option>
+    <option value="81">81</option><option value="100">100</option>
+  </select></label>
+  <label>Bias: <input type="range" id="bias" min="0" max="200" value="100"><input type="number" id="biasNum" step="0.1" value="1.0"></label>
+  <label>Hole: <input type="range" id="holemul" min="0" max="200" value="100"><input type="number" id="holeNum" step="0.05" value="1.0"></label>
+  <label>Color: <input type="range" id="colorwt" min="0" max="100" value="60"></label>
+  <button id="pause">Resume</button>
+  <button id="reset">Reset</button>
+  <span id="fps"></span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2');
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+
+let nTiles = 4, cols, TILE, SIZE, paused = true;
+
+function resize() {
+  const s = Math.min(window.innerWidth, window.innerHeight);
+  cols = Math.ceil(Math.sqrt(nTiles));
+  TILE = Math.floor(s / cols);
+  SIZE = cols * TILE;
+  canvas.width = SIZE; canvas.height = SIZE;
+  canvas.style.width = SIZE + 'px'; canvas.style.height = SIZE + 'px';
+}
+resize();
+
+function makeTex2D(w, h, data) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFBO(t) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return f;
+}
+
+function initMainData() {
+  const d = new Float32Array(SIZE * SIZE * 4);
+  for (let tile = 0; tile < nTiles; tile++) {
+    const tc = tile % cols, tr = Math.floor(tile / cols);
+    for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+      const dx = (x + 0.5) / TILE * 2 - 1, dy = (y + 0.5) / TILE * 2 - 1;
+      const v = dx*dx + dy*dy < 1.0 ? 1.0 : 0.001;
+      const idx = ((tr * TILE + y) * SIZE + tc * TILE + x) * 4;
+      d[idx] = v; d[idx+1] = v; d[idx+2] = v; d[idx+3] = 1;
+    }
+  }
+  return d;
+}
+
+let texMain, fboMain, texTemp, fboTemp;
+function createTextures() {
+  if (texMain) gl.deleteTexture(texMain);
+  if (texTemp) gl.deleteTexture(texTemp);
+  texMain = makeTex2D(SIZE, SIZE, initMainData());
+  fboMain = makeFBO(texMain);
+  texTemp = makeTex2D(TILE, TILE, null);
+  fboTemp = makeFBO(texTemp);
+}
+createTextures();
+
+const qb = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+function sh(s,t){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+  if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(o));throw gl.getShaderInfoLog(o);}return o;}
+function pr(v,f){const p=gl.createProgram();gl.attachShader(p,sh(v,gl.VERTEX_SHADER));
+  gl.attachShader(p,sh(f,gl.FRAGMENT_SHADER));gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){console.error(gl.getProgramInfoLog(p));}return p;}
+
+const VS = `#version 300 es
+in vec2 pos; out vec2 uv;
+void main(){uv=pos*0.5+0.5;gl_Position=vec4(pos,0,1);}`;
+
+// Iteration shader: renders one tile's blowup update.
+// Annulus samples from tile i, hole samples from tile j (with tint).
+const iterProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uTex;
+uniform vec2 uOffI;       // UV offset of tile i in texture
+uniform vec2 uOffJ;       // UV offset of tile j in texture
+uniform float uTileUV;    // tile size in UV coords (1/cols)
+uniform vec2 holeCenter;  // hole center in disk coords [-1,1]
+uniform float holeRadius;
+uniform float bias;
+uniform vec3 tint;        // tint multiplier for tile j content
+uniform vec3 uScale;      // normalization
+uniform float rotAngle;   // rotation applied to inserted tile content
+
+void main(){
+  vec2 w = uv * 2.0 - 1.0;
+  if(dot(w,w) > 1.0){ fragColor = vec4(0.001,0.001,0.001,1); return; }
+
+  vec2 d = w - holeCenter;
+  float r = length(d);
+
+  vec3 sampled;
+  float j;
+
+  if(r >= holeRadius){
+    // Annulus: radial collapse with bias, sample from tile i
+    float t = (r - holeRadius) / max(1.0 - holeRadius, 0.01);
+    float R = pow(max(t, 1e-6), bias);
+    vec2 z = holeCenter + (d / max(r, 1e-6)) * R;
+    if(dot(z,z) > 1.0){ fragColor = vec4(0.001,0.001,0.001,1); return; }
+    vec2 sUV = uOffI + (z * 0.5 + 0.5) * uTileUV;
+    sampled = texture(uTex, sUV).rgb;
+    j = bias * pow(max(t, 1e-6), 2.0*bias - 1.0) / max(r * (1.0 - holeRadius), 1e-6);
+  } else {
+    // Hole: contracted copy from tile j, rotated
+    float cs = cos(rotAngle), sn = sin(rotAngle);
+    vec2 dr = vec2(d.x*cs - d.y*sn, d.x*sn + d.y*cs);
+    vec2 z = dr / holeRadius;
+    vec2 sUV = uOffJ + (z * 0.5 + 0.5) * uTileUV;
+    sampled = texture(uTex, sUV).rgb * tint;
+    j = 1.0 / (holeRadius * holeRadius);
+  }
+
+  j = min(j, 10.0);
+  vec3 v = clamp(sampled * j * uScale, vec3(0.001), vec3(100.0));
+  fragColor = vec4(v, 1.0);
+}`);
+
+// Display shader: grid of disks with log-scale + gamma
+const dispProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uTex;
+uniform vec3 uLM;
+uniform float uG;
+uniform int cols;
+uniform int nTiles;
+
+void main(){
+  vec2 gp = uv * float(cols);
+  int col = int(floor(gp.x));
+  int row = int(floor(gp.y));
+  int idx = row * cols + col;
+  if(idx >= nTiles || col >= cols){ fragColor = vec4(0,0,0,1); return; }
+
+  vec2 tc = fract(gp);
+  vec2 dc = tc * 2.0 - 1.0;
+  if(dot(dc,dc) > 1.0){ fragColor = vec4(0,0,0,1); return; }
+
+  vec3 d = texture(uTex, uv).rgb;
+  vec3 v;
+  v.r = uLM.r>0.001 ? pow(clamp(log(1.0+abs(d.r))/uLM.r,0.0,1.0),uG) : 0.0;
+  v.g = uLM.g>0.001 ? pow(clamp(log(1.0+abs(d.g))/uLM.g,0.0,1.0),uG) : 0.0;
+  v.b = uLM.b>0.001 ? pow(clamp(log(1.0+abs(d.b))/uLM.b,0.0,1.0),uG) : 0.0;
+  fragColor = vec4(v, 1);
+}`);
+
+let frame = 0, fpsS = 0, fpsLastTime = 0;
+// Per-tile normalization
+const runAvgs = Array.from({length: 100}, () => [1, 1, 1]);
+const logMax = new Float32Array([1, 1, 1]);
+
+// Tint colors per tile index (16 entries, cycling hues)
+const TINTS = [];
+for (let i = 0; i < 100; i++) {
+  const h = i / 16 * Math.PI * 2;
+  TINTS.push([0.5+0.5*Math.cos(h), 0.5+0.5*Math.cos(h-2.094), 0.5+0.5*Math.cos(h+2.094)]);
+}
+
+// Bias/Hole slider ↔ number sync
+function biasFromSlider(v) { return Math.pow(10, v / 100.0 - 1.0); }
+function biasToSlider(v) { return (Math.log10(Math.max(v,0.01)) + 1.0) * 100.0; }
+function holeFromSlider(v) { return Math.pow(2, v / 50.0 - 2.0); }
+function holeToSlider(v) { return (Math.log2(Math.max(v,0.01)) + 2.0) * 50.0; }
+document.getElementById('bias').addEventListener('input', function(){
+  document.getElementById('biasNum').value = biasFromSlider(this.value).toFixed(2);
+});
+document.getElementById('biasNum').addEventListener('change', function(){
+  document.getElementById('bias').value = biasToSlider(parseFloat(this.value));
+});
+document.getElementById('holemul').addEventListener('input', function(){
+  document.getElementById('holeNum').value = holeFromSlider(this.value).toFixed(2);
+});
+document.getElementById('holeNum').addEventListener('change', function(){
+  document.getElementById('holemul').value = holeToSlider(parseFloat(this.value));
+});
+
+function drawQ(p) {
+  const a = gl.getAttribLocation(p, 'pos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.enableVertexAttribArray(a);
+  gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function resetImage() {
+  frame = 0;
+  for (let t = 0; t < 100; t++) { runAvgs[t][0]=1; runAvgs[t][1]=1; runAvgs[t][2]=1; }
+  logMax[0]=1; logMax[1]=1; logMax[2]=1;
+  gl.bindTexture(gl.TEXTURE_2D, texMain);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, initMainData());
+}
+
+function punchHole(ti, tj, hx, hy, holeRad, rot, biasVal) {
+  const tileUV = 1.0 / cols;
+  const tc_i = ti % cols, tr_i = Math.floor(ti / cols);
+  const tc_j = tj % cols, tr_j = Math.floor(tj / cols);
+
+  const cStr = document.getElementById('colorwt').value / 100.0;
+  const tc = TINTS[tj % TINTS.length];
+  // Mix from white (1,1,1) toward the tile's color
+  const tint = [1 - cStr * (1 - tc[0]), 1 - cStr * (1 - tc[1]), 1 - cStr * (1 - tc[2])];
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboTemp);
+  gl.viewport(0, 0, TILE, TILE);
+  gl.useProgram(iterProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texMain);
+  gl.uniform1i(gl.getUniformLocation(iterProg, 'uTex'), 0);
+  gl.uniform2f(gl.getUniformLocation(iterProg, 'uOffI'), tc_i * tileUV, tr_i * tileUV);
+  gl.uniform2f(gl.getUniformLocation(iterProg, 'uOffJ'), tc_j * tileUV, tr_j * tileUV);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'uTileUV'), tileUV);
+  gl.uniform2f(gl.getUniformLocation(iterProg, 'holeCenter'), hx, hy);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'holeRadius'), holeRad);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'bias'), biasVal != null ? biasVal : Math.pow(10, document.getElementById('bias').value / 100.0 - 1.0));
+  gl.uniform3fv(gl.getUniformLocation(iterProg, 'tint'), tint);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'rotAngle'), rot || 0);
+  gl.uniform3fv(gl.getUniformLocation(iterProg, 'uScale'), runAvgs[ti]);
+  drawQ(iterProg);
+
+  // Copy temp FBO → texMain at tile i's position
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboTemp);
+  gl.bindTexture(gl.TEXTURE_2D, texMain);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, tc_i * TILE, tr_i * TILE, 0, 0, TILE, TILE);
+}
+
+function doIter() {
+  const holeMulSlider = Math.pow(2, document.getElementById('holemul').value / 50.0 - 2.0);
+  const biasSlider = Math.pow(10, document.getElementById('bias').value / 100.0 - 1.0);
+  const buf = new Float32Array(4);
+  const step = Math.max(1, Math.floor(TILE / 8));
+
+  for (let i = 0; i < nTiles; i++) {
+    const j = Math.floor(Math.random() * nTiles);
+    const theta = Math.random() * Math.PI * 2;
+    const rCenter = Math.sqrt(Math.random()) * 0.75;
+    const hx = rCenter * Math.cos(theta);
+    const hy = rCenter * Math.sin(theta);
+
+    // Per-tile bias and hole based on grid position
+    const tc = i % cols, tr = Math.floor(i / cols);
+    const tx = cols > 1 ? tc / (cols - 1) : 0.5;  // 0..1 across columns
+    const ty = cols > 1 ? tr / (cols - 1) : 0.5;  // 0..1 across rows
+    const tileBias = (0.4 + 0.6 * tx) * biasSlider;  // .4 to 1 * slider
+    const tileHoleMul = (0.5 + 1.5 * ty) * holeMulSlider; // .5 to 2 * slider
+    const holeRad = Math.min(0.15 * tileHoleMul, 0.7);
+
+    punchHole(i, j, hx, hy, holeRad, Math.random() * Math.PI * 2, tileBias);
+
+    // Per-tile normalization
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboTemp);
+    let sums = [0,0,0], cnt = 0;
+    for (let y = step; y < TILE; y += step) for (let x = step; x < TILE; x += step) {
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, buf);
+      if (isFinite(buf[0]) && isFinite(buf[1]) && isFinite(buf[2])) {
+        sums[0] += buf[0]; sums[1] += buf[1]; sums[2] += buf[2]; cnt++;
+      }
+    }
+    if (cnt > 0) {
+      const ra = runAvgs[i];
+      for (let c = 0; c < 3; c++) {
+        const avg = sums[c] / cnt;
+        if (!isFinite(avg)) { resetImage(); return; }
+        const desired = avg > 1e-10 ? Math.min(0.5/avg, 10.0) : 1.0;
+        ra[c] = ra[c] * 0.95 + desired * 0.05;
+      }
+    }
+  }
+}
+
+function display() {
+  // Track display max from main texture
+  if (frame % 10 === 0) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboMain);
+    const b = new Float32Array(4);
+    let mx = [0,0,0];
+    const step = Math.max(1, Math.floor(SIZE / 8));
+    for (let y = 0; y < SIZE; y += step) for (let x = 0; x < SIZE; x += step) {
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, b);
+      mx[0] = Math.max(mx[0], Math.abs(b[0]));
+      mx[1] = Math.max(mx[1], Math.abs(b[1]));
+      mx[2] = Math.max(mx[2], Math.abs(b[2]));
+    }
+    for (let c = 0; c < 3; c++) {
+      const nl = Math.log(1 + mx[c]);
+      logMax[c] = logMax[c] * 0.8 + nl * 0.2;
+      if (logMax[c] < 0.01) logMax[c] = 0.01;
+    }
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texMain);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'uTex'), 0);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uLM'), logMax);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uG'), 0.45);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'cols'), cols);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'nTiles'), nTiles);
+  drawQ(dispProg);
+}
+
+canvas.addEventListener('click', function(e) {
+  if (!paused) return;
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) / rect.width;  // UV [0,1]
+  const cy = 1.0 - (e.clientY - rect.top) / rect.height;
+  const gx = cx * cols, gy = cy * cols;
+  const col = Math.floor(gx), row = Math.floor(gy);
+  const ti = row * cols + col;
+  if (ti >= nTiles || col >= cols) return;
+  // Disk coords [-1,1] within the tile
+  const dx = (gx - col) * 2 - 1, dy = (gy - row) * 2 - 1;
+  if (dx*dx + dy*dy > 1.0) return;
+  // Pick random source tile
+  const tj = Math.floor(Math.random() * nTiles);
+  // Use current hole radius from slider
+  const holeMul = Math.pow(2, document.getElementById('holemul').value / 50.0 - 2.0);
+  const holeRad = Math.min(0.15 * holeMul, 0.7);
+  punchHole(ti, tj, dx, dy, holeRad, Math.random() * Math.PI * 2);
+});
+document.getElementById('pause').addEventListener('click', function(){
+  paused = !paused;
+  this.textContent = paused ? 'Resume' : 'Pause';
+});
+document.getElementById('reset').addEventListener('click', function(){
+  resetImage();
+});
+document.getElementById('ntiles').addEventListener('change', function(){
+  nTiles = parseInt(this.value);
+  resize();
+  createTextures();
+  resetImage();
+});
+
+function loop() {
+  if (!paused) doIter();
+  display();
+
+  frame++;
+  if (frame % 30 === 0) {
+    gl.finish();
+    const now = performance.now();
+    if (fpsLastTime > 0) fpsS = 30000 / (now - fpsLastTime);
+    fpsLastTime = now;
+    document.getElementById('fps').textContent = fpsS.toFixed(0) + ' fps';
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
