@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Möbius IFS — 3D Fractal</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; font-family: monospace; }
+  canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  .controls {
+    position: fixed; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
+    color: #aaa; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .controls label { cursor: pointer; white-space: nowrap; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .controls input[type=range] { width: 90px; }
+  .controls select { background: #333; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 2px; }
+  #fps { text-align: right; }
+</style>
+</head>
+<body>
+<div class="controls">
+  <label>Funcs: <select id="nfuncs">
+    <option value="1">1</option><option value="2">2</option>
+    <option value="3">3</option><option value="4" selected>4</option>
+    <option value="5">5</option><option value="6">6</option>
+  </select></label>
+  <label>Voxels: <select id="voxres">
+    <option value="32">32</option><option value="48">48</option>
+    <option value="64" selected>64</option><option value="96">96</option>
+    <option value="128">128</option><option value="192">192</option>
+    <option value="256">256</option><option value="384">384</option>
+    <option value="512">512</option>
+  </select></label>
+  <label>Size: <input type="range" id="sizemul" min="0" max="200" value="100"></label>
+  <label>Density: <input type="range" id="density" min="5" max="400" value="80"></label>
+  <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
+  <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
+  <button id="randomize">Randomize</button>
+  <span id="fps"></span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+function resize() {
+  const s = Math.min(window.innerWidth, window.innerHeight);
+  canvas.width = s; canvas.height = s;
+  canvas.style.width = s + 'px'; canvas.style.height = s + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+const gl = canvas.getContext('webgl2');
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+
+let N = 64;
+
+function makeTex3D(n, data) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, t);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, n, n, n, 0, gl.RGBA, gl.FLOAT, data);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+function makeInitData(n) {
+  const d = new Float32Array(n*n*n*4);
+  for (let i = 0; i < n*n*n; i++) {
+    const ix = i % n, iy = Math.floor(i / n) % n, iz = Math.floor(i / (n*n));
+    const x = (ix+0.5)/n*2-1, y = (iy+0.5)/n*2-1, z = (iz+0.5)/n*2-1;
+    const v = x*x+y*y+z*z < 1.0 ? 1.0 : 0.001;
+    d[i*4]=v; d[i*4+1]=v; d[i*4+2]=v; d[i*4+3]=1;
+  }
+  return d;
+}
+
+let init3D = makeInitData(N);
+let texA = makeTex3D(N, init3D), texB = makeTex3D(N, init3D);
+const fbo = gl.createFramebuffer();
+
+const qb = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+function sh(s,t){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+  if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(o));throw gl.getShaderInfoLog(o);}return o;}
+function pr(v,f){const p=gl.createProgram();gl.attachShader(p,sh(v,gl.VERTEX_SHADER));
+  gl.attachShader(p,sh(f,gl.FRAGMENT_SHADER));gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){console.error(gl.getProgramInfoLog(p));}return p;}
+
+const VS = `#version 300 es
+in vec2 pos; out vec2 uv;
+void main(){uv=pos*0.5+0.5;gl_Position=vec4(pos,0,1);}`;
+
+// Contractive IFS iteration: each transform maps the unit ball
+// into a smaller sphere at center c with radius r.
+// Backward map: z = (w - c) / r
+const iterProg = pr(VS, `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 uv; out vec4 fragColor;
+uniform sampler3D uD;
+uniform float a[24]; // 4 per transform, up to 6
+uniform float sliceZ;
+uniform int nT;
+uniform float cw;
+uniform float sizeMul;
+uniform vec3 uScale;
+
+vec3 colorWeight(int t){
+  if(t==0) return vec3(cw,1.0,1.0);
+  if(t==1) return vec3(1.0,cw,1.0);
+  if(t==2) return vec3(1.0,1.0,cw);
+  if(t==3) return vec3(cw,cw,1.0);
+  if(t==4) return vec3(cw,1.0,cw);
+  return vec3(1.0,cw,cw);
+}
+
+void main(){
+  vec3 w = vec3(uv * 2.0 - 1.0, sliceZ * 2.0 - 1.0);
+  if(dot(w,w) > 1.0){ fragColor = vec4(0.001,0.001,0.001,1); return; }
+
+  vec3 acc = vec3(0.0);
+  vec3 wTot = vec3(0.0);
+
+  for(int t = 0; t < 6; t++){
+    if(t >= nT) break;
+    int b = t * 4;
+    vec3 c = vec3(0.45*sin(a[b]), 0.45*sin(a[b+1]), 0.45*sin(a[b+2]));
+    float r = clamp((0.15 + 0.25*(0.5+0.5*sin(a[b+3]))) * sizeMul, 0.05, 0.8);
+
+    // Backward map: z = (w - c) / r  (invert the contraction)
+    vec3 z = (w - c) / r;
+    if(dot(z,z) > 1.0) continue; // maps outside the ball
+
+    // Jacobian of 3D scaling: 1/r^3
+    float j = min(1.0 / (r*r*r), 100.0);
+
+    vec3 s = z * 0.5 + 0.5;
+    vec3 sampled = texture(uD, s).rgb;
+    vec3 cwt = colorWeight(t);
+    acc += sampled * j * cwt;
+    wTot += cwt;
+  }
+
+  vec3 v = vec3(
+    wTot.r > 0.0 ? acc.r/wTot.r : 0.0,
+    wTot.g > 0.0 ? acc.g/wTot.g : 0.0,
+    wTot.b > 0.0 ? acc.b/wTot.b : 0.0
+  );
+  v = clamp(v * uScale, vec3(0.001), vec3(100.0));
+  fragColor = vec4(v, 1.0);
+}`);
+
+// Ray-marching volume display shader (same as blowup3d)
+const dispProg = pr(VS, `#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 uv; out vec4 fragColor;
+uniform sampler3D uVol;
+uniform vec3 uCamPos;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform vec3 uCamFwd;
+uniform float uDensity;
+uniform float uFov;
+uniform float uVoxSize; // 1.0/N in texture coords
+
+vec2 sphereHit(vec3 ro, vec3 rd){
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - 1.0;
+  float h = b*b - c;
+  if(h < 0.0) return vec2(-1.0);
+  h = sqrt(h);
+  return vec2(-b-h, -b+h);
+}
+
+void main(){
+  vec2 ndc = uv * 2.0 - 1.0;
+  vec3 rd = normalize(uCamFwd + ndc.x * uCamRight * uFov + ndc.y * uCamUp * uFov);
+  vec3 ro = uCamPos;
+
+  vec2 t = sphereHit(ro, rd);
+  if(t.y < 0.0){ fragColor = vec4(0,0,0,1); return; }
+
+  float tNear = max(t.x, 0.0);
+  float tFar = t.y;
+
+  const int STEPS = 80;
+  float dt = (tFar - tNear) / float(STEPS);
+  // Jitter ray start to break up banding
+  float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(127.1, 311.7))) * 43758.5453);
+  tNear += jitter * dt;
+  vec3 col = vec3(0.0);
+  float alpha = 0.0;
+
+  vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+  float eps = uVoxSize;
+
+  for(int i = 0; i < STEPS; i++){
+    float tc = tNear + (float(i) + 0.5) * dt;
+    vec3 pos = ro + rd * tc;
+    vec3 uvw = pos * 0.5 + 0.5;
+
+    vec3 d = texture(uVol, uvw).rgb;
+    float dens = (d.r + d.g + d.b) / 3.0;
+    if(dens < 0.01) continue;
+
+    float a = 1.0 - exp(-dens * dt * uDensity);
+    vec3 c = d / max(dens, 0.001);
+
+    if(dens > 0.05){
+      vec3 gr;
+      gr.x = texture(uVol, uvw+vec3(eps,0,0)).r - texture(uVol, uvw-vec3(eps,0,0)).r;
+      gr.y = texture(uVol, uvw+vec3(0,eps,0)).r - texture(uVol, uvw-vec3(0,eps,0)).r;
+      gr.z = texture(uVol, uvw+vec3(0,0,eps)).r - texture(uVol, uvw-vec3(0,0,eps)).r;
+      float gl2 = dot(gr, gr);
+      if(gl2 > 0.0001){
+        vec3 n = gr / sqrt(gl2);
+        float diff = max(dot(n, lightDir), 0.0) * 0.6 + 0.4;
+        c *= diff;
+      }
+    }
+
+    col += (1.0 - alpha) * a * c;
+    alpha += (1.0 - alpha) * a;
+    if(alpha > 0.99) break;
+  }
+
+  col = pow(max(col, vec3(0.0)), vec3(0.45));
+  fragColor = vec4(col, 1.0);
+}`);
+
+const NPARAMS = 24;
+const rng = (function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
+const baseAngles = new Float32Array(NPARAMS), vels = new Float32Array(NPARAMS), phases = new Float32Array(NPARAMS);
+for (let i = 0; i < NPARAMS; i++) { baseAngles[i] = rng()*Math.PI*2; vels[i] = (rng()-0.5)*0.4; }
+
+let nFuncs = 4, pp = 0, frame = 0, fpsS = 0, fpsLastTime = 0;
+const runAvg = [1, 1, 1];
+
+let camAz = 0, camEl = 0.3, camDist = 2.2, camAutoRot = true;
+let mDown = false, mLX, mLY;
+canvas.addEventListener('mousedown', e => { mDown = true; mLX = e.clientX; mLY = e.clientY; camAutoRot = false; });
+window.addEventListener('mouseup', () => mDown = false);
+canvas.addEventListener('mousemove', e => {
+  if (!mDown) return;
+  camAz -= (e.clientX - mLX) * 0.01;
+  camEl = Math.max(-1.2, Math.min(1.2, camEl + (e.clientY - mLY) * 0.01));
+  mLX = e.clientX; mLY = e.clientY;
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  camDist = Math.max(1.2, Math.min(6.0, camDist * (1 + e.deltaY * 0.001)));
+}, {passive: false});
+canvas.addEventListener('dblclick', () => { camAutoRot = true; });
+
+function drawQ(p) {
+  const a = gl.getAttribLocation(p, 'pos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.enableVertexAttribArray(a);
+  gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function resetImage() {
+  frame = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
+  init3D = makeInitData(N);
+  for (const t of [texA, texB]) {
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, N, N, N, 0, gl.RGBA, gl.FLOAT, init3D);
+  }
+}
+
+function changeResolution(newN) {
+  N = newN;
+  gl.deleteTexture(texA); gl.deleteTexture(texB);
+  init3D = makeInitData(N);
+  texA = makeTex3D(N, init3D); texB = makeTex3D(N, init3D);
+  frame = 0; pp = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
+}
+
+function doIter(ang) {
+  const readTex = pp === 0 ? texA : texB;
+  const writeTex = pp === 0 ? texB : texA;
+
+  gl.useProgram(iterProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_3D, readTex);
+  gl.uniform1i(gl.getUniformLocation(iterProg, 'uD'), 0);
+  gl.uniform1fv(gl.getUniformLocation(iterProg, 'a'), ang);
+  gl.uniform1i(gl.getUniformLocation(iterProg, 'nT'), nFuncs);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'cw'), document.getElementById('colorwt').value / 100.0);
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'sizeMul'), Math.pow(2, document.getElementById('sizemul').value / 50.0 - 2.0));
+  gl.uniform3fv(gl.getUniformLocation(iterProg, 'uScale'), runAvg);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, N, N);
+
+  const sliceZLoc = gl.getUniformLocation(iterProg, 'sliceZ');
+  for (let z = 0; z < N; z++) {
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, writeTex, 0, z);
+    gl.uniform1f(sliceZLoc, (z + 0.5) / N);
+    drawQ(iterProg);
+  }
+
+  if (frame % 3 === 0) {
+    const midZ = Math.floor(N / 2);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, writeTex, 0, midZ);
+    const sz = 8, ox = Math.floor((N - sz) / 2);
+    const buf = new Float32Array(sz * sz * 4);
+    gl.readPixels(ox, ox, sz, sz, gl.RGBA, gl.FLOAT, buf);
+    let sums = [0, 0, 0], cnt = 0;
+    for (let i = 0; i < sz * sz; i++) {
+      const r = buf[i*4], g = buf[i*4+1], b = buf[i*4+2];
+      if (isFinite(r) && isFinite(g) && isFinite(b)) { sums[0] += r; sums[1] += g; sums[2] += b; cnt++; }
+    }
+    if (cnt > 0 && (sums[0]+sums[1]+sums[2]) > 0.001*cnt) {
+      for (let c = 0; c < 3; c++) {
+        const avg = sums[c] / cnt;
+        if (!isFinite(avg)) { resetImage(); pp = 1 - pp; return; }
+        const desired = avg > 1e-10 ? Math.min(0.5/avg, 10.0) : 1.0;
+        runAvg[c] = runAvg[c] * 0.95 + desired * 0.05;
+      }
+    } else if (frame > 10) { resetImage(); pp = 1 - pp; return; }
+  }
+
+  pp = 1 - pp;
+}
+
+function norm3(v) { const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [v[0]/l, v[1]/l, v[2]/l]; }
+function cross3(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+
+function display() {
+  const cp = [
+    Math.sin(camAz) * Math.cos(camEl) * camDist,
+    Math.sin(camEl) * camDist,
+    Math.cos(camAz) * Math.cos(camEl) * camDist
+  ];
+  const fwd = norm3([-cp[0], -cp[1], -cp[2]]);
+  const right = norm3(cross3(fwd, [0, 1, 0]));
+  const up = cross3(right, fwd);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(dispProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_3D, pp === 0 ? texA : texB);
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'uVol'), 0);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamPos'), cp);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamRight'), right);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamUp'), up);
+  gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamFwd'), fwd);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uDensity'), document.getElementById('density').value / 10.0);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uFov'), 1.0 / camDist);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uVoxSize'), 1.0 / N);
+  drawQ(dispProg);
+}
+
+document.getElementById('randomize').addEventListener('click', function(){
+  for(let i=0;i<NPARAMS;i++){baseAngles[i]=Math.random()*Math.PI*2;vels[i]=(Math.random()-0.5)*0.4;phases[i]=0;}
+  resetImage();
+});
+document.getElementById('nfuncs').addEventListener('change', function(){
+  nFuncs = parseInt(this.value); resetImage();
+});
+document.getElementById('voxres').addEventListener('change', function(){
+  changeResolution(parseInt(this.value));
+});
+
+function loop() {
+  const speedPct = document.getElementById('speed').value / 100.0;
+  const dt = 1.0 / 60.0;
+  for (let i = 0; i < NPARAMS; i++) phases[i] += vels[i] * dt * speedPct;
+  if (camAutoRot) camAz += dt * 0.3;
+
+  const ang = new Float32Array(NPARAMS);
+  for (let i = 0; i < NPARAMS; i++) ang[i] = baseAngles[i] + phases[i];
+
+  doIter(ang);
+  display();
+
+  frame++;
+  if (frame % 30 === 0) {
+    gl.finish(); // sync GPU to get real frame time
+    const now = performance.now();
+    if (fpsLastTime > 0) fpsS = 30000 / (now - fpsLastTime);
+    fpsLastTime = now;
+    document.getElementById('fps').textContent = fpsS.toFixed(0) + ' fps';
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
