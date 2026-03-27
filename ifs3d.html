@@ -32,8 +32,9 @@
     <option value="256">256</option><option value="384">384</option>
     <option value="512">512</option>
   </select></label>
-  <label>Size: <input type="range" id="sizemul" min="0" max="200" value="100"></label>
-  <label>Density: <input type="range" id="density" min="5" max="400" value="80"></label>
+  <label>Det: <input type="range" id="det" min="0" max="300" value="100"></label>
+  <label>Round: <input type="range" id="round" min="0" max="100" value="50"></label>
+  <label>Density: <input type="range" id="density" min="1" max="400" value="80"></label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <button id="randomize">Randomize</button>
@@ -97,19 +98,20 @@ const VS = `#version 300 es
 in vec2 pos; out vec2 uv;
 void main(){uv=pos*0.5+0.5;gl_Position=vec4(pos,0,1);}`;
 
-// Contractive IFS iteration: each transform maps the unit ball
-// into a smaller sphere at center c with radius r.
-// Backward map: z = (w - c) / r
+// Affine IFS iteration: each transform is f(z) = c + R*D*z*scale
+// where R is a rotation, D is unit-det diagonal stretch, scale = det^(1/3).
+// Backward map: z = D^{-1} * R^T * (w - c) / scale
 const iterProg = pr(VS, `#version 300 es
 precision highp float;
 precision highp sampler3D;
 in vec2 uv; out vec4 fragColor;
 uniform sampler3D uD;
-uniform float a[24]; // 4 per transform, up to 6
+uniform float a[48]; // 8 per transform, up to 6
 uniform float sliceZ;
 uniform int nT;
 uniform float cw;
-uniform float sizeMul;
+uniform float det;    // shared determinant for all transforms
+uniform float round;  // 0=full stretch, 1=rotation only (spherical copies)
 uniform vec3 uScale;
 
 vec3 colorWeight(int t){
@@ -121,38 +123,58 @@ vec3 colorWeight(int t){
   return vec3(1.0,cw,cw);
 }
 
+// Rotation matrix from Euler angles (ZYX convention)
+mat3 rotMat(float rx, float ry, float rz){
+  float cx=cos(rx),sx=sin(rx),cy=cos(ry),sy=sin(ry),cz=cos(rz),sz=sin(rz);
+  return mat3(
+    vec3(cy*cz, cy*sz, -sy),
+    vec3(sx*sy*cz-cx*sz, sx*sy*sz+cx*cz, sx*cy),
+    vec3(cx*sy*cz+sx*sz, cx*sy*sz-sx*cz, cx*cy)
+  );
+}
+
 void main(){
   vec3 w = vec3(uv * 2.0 - 1.0, sliceZ * 2.0 - 1.0);
   if(dot(w,w) > 1.0){ fragColor = vec4(0.001,0.001,0.001,1); return; }
 
+  float gs = pow(det, 1.0/3.0); // global scale = det^(1/3)
+  float j = min(1.0 / det, 200.0); // Jacobian = 1/det, same for all
+
   vec3 acc = vec3(0.0);
-  vec3 wTot = vec3(0.0);
+  float wTot = 0.0;
 
   for(int t = 0; t < 6; t++){
     if(t >= nT) break;
-    int b = t * 4;
+    int b = t * 8;
+
+    // Center
     vec3 c = vec3(0.45*sin(a[b]), 0.45*sin(a[b+1]), 0.45*sin(a[b+2]));
-    float r = clamp((0.15 + 0.25*(0.5+0.5*sin(a[b+3]))) * sizeMul, 0.05, 0.8);
 
-    // Backward map: z = (w - c) / r  (invert the contraction)
-    vec3 z = (w - c) / r;
-    if(dot(z,z) > 1.0) continue; // maps outside the ball
+    // Rotation from 3 Euler angles
+    mat3 R = rotMat(a[b+3], a[b+4], a[b+5]);
 
-    // Jacobian of 3D scaling: 1/r^3
-    float j = min(1.0 / (r*r*r), 100.0);
+    // Non-uniform stretch (unit determinant): s1*s2*s3 = 1
+    // round=1 → no stretch (s=1), round=0 → extreme stretch
+    float k = 3.0 * (1.0 - round);
+    float s1 = exp(k*sin(a[b+6]));
+    float s2 = exp(k*sin(a[b+7]));
+    float s3 = 1.0 / (s1*s2);
+
+    // Backward map: z = D^{-1} * R^T * (w - c) / gs
+    vec3 d = w - c;
+    vec3 rd = transpose(R) * d; // rotate back
+    vec3 z = vec3(rd.x/(s1*gs), rd.y/(s2*gs), rd.z/(s3*gs));
+
+    if(dot(z,z) > 1.0) continue;
 
     vec3 s = z * 0.5 + 0.5;
     vec3 sampled = texture(uD, s).rgb;
     vec3 cwt = colorWeight(t);
     acc += sampled * j * cwt;
-    wTot += cwt;
+    wTot += j;
   }
 
-  vec3 v = vec3(
-    wTot.r > 0.0 ? acc.r/wTot.r : 0.0,
-    wTot.g > 0.0 ? acc.g/wTot.g : 0.0,
-    wTot.b > 0.0 ? acc.b/wTot.b : 0.0
-  );
+  vec3 v = wTot > 0.0 ? acc / wTot : vec3(0.0);
   v = clamp(v * uScale, vec3(0.001), vec3(100.0));
   fragColor = vec4(v, 1.0);
 }`);
@@ -236,7 +258,7 @@ void main(){
   fragColor = vec4(col, 1.0);
 }`);
 
-const NPARAMS = 24;
+const NPARAMS = 48; // 8 per transform × 6 max
 const rng = (function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
 const baseAngles = new Float32Array(NPARAMS), vels = new Float32Array(NPARAMS), phases = new Float32Array(NPARAMS);
 for (let i = 0; i < NPARAMS; i++) { baseAngles[i] = rng()*Math.PI*2; vels[i] = (rng()-0.5)*0.4; }
@@ -296,7 +318,8 @@ function doIter(ang) {
   gl.uniform1fv(gl.getUniformLocation(iterProg, 'a'), ang);
   gl.uniform1i(gl.getUniformLocation(iterProg, 'nT'), nFuncs);
   gl.uniform1f(gl.getUniformLocation(iterProg, 'cw'), document.getElementById('colorwt').value / 100.0);
-  gl.uniform1f(gl.getUniformLocation(iterProg, 'sizeMul'), Math.pow(2, document.getElementById('sizemul').value / 50.0 - 2.0));
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'det'), Math.pow(2, document.getElementById('det').value / 60.0 - 5.0));
+  gl.uniform1f(gl.getUniformLocation(iterProg, 'round'), document.getElementById('round').value / 100.0);
   gl.uniform3fv(gl.getUniformLocation(iterProg, 'uScale'), runAvg);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
