@@ -25,6 +25,13 @@
     <option value="3">3</option><option value="4" selected>4</option>
     <option value="5">5</option><option value="6">6</option>
   </select></label>
+  <label>Voxels: <select id="voxres">
+    <option value="32">32</option><option value="48">48</option>
+    <option value="64" selected>64</option><option value="96">96</option>
+    <option value="128">128</option><option value="192">192</option>
+    <option value="256">256</option><option value="384">384</option>
+    <option value="512">512</option>
+  </select></label>
   <label>Bias: <input type="range" id="bias" min="0" max="200" value="100"></label>
   <label>Hole: <input type="range" id="holemul" min="0" max="200" value="100"></label>
   <label>Density: <input type="range" id="density" min="5" max="400" value="80"></label>
@@ -48,12 +55,12 @@ const gl = canvas.getContext('webgl2');
 gl.getExtension('EXT_color_buffer_float');
 gl.getExtension('OES_texture_float_linear');
 
-const N = 64; // voxel resolution
+let N = 64;
 
-function makeTex3D(data) {
+function makeTex3D(n, data) {
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_3D, t);
-  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, N, N, N, 0, gl.RGBA, gl.FLOAT, data);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, n, n, n, 0, gl.RGBA, gl.FLOAT, data);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -62,16 +69,19 @@ function makeTex3D(data) {
   return t;
 }
 
-// Initialize: 1.0 inside unit ball, 0.001 outside
-const init3D = new Float32Array(N*N*N*4);
-for (let i = 0; i < N*N*N; i++) {
-  const ix = i % N, iy = Math.floor(i / N) % N, iz = Math.floor(i / (N*N));
-  const x = (ix + 0.5) / N * 2 - 1, y = (iy + 0.5) / N * 2 - 1, z = (iz + 0.5) / N * 2 - 1;
-  const v = x*x + y*y + z*z < 1.0 ? 1.0 : 0.001;
-  init3D[i*4] = v; init3D[i*4+1] = v; init3D[i*4+2] = v; init3D[i*4+3] = 1;
+function makeInitData(n) {
+  const d = new Float32Array(n*n*n*4);
+  for (let i = 0; i < n*n*n; i++) {
+    const ix = i % n, iy = Math.floor(i / n) % n, iz = Math.floor(i / (n*n));
+    const x = (ix+0.5)/n*2-1, y = (iy+0.5)/n*2-1, z = (iz+0.5)/n*2-1;
+    const v = x*x+y*y+z*z < 1.0 ? 1.0 : 0.001;
+    d[i*4]=v; d[i*4+1]=v; d[i*4+2]=v; d[i*4+3]=1;
+  }
+  return d;
 }
 
-const texA = makeTex3D(init3D), texB = makeTex3D(init3D);
+let init3D = makeInitData(N);
+let texA = makeTex3D(N, init3D), texB = makeTex3D(N, init3D);
 const fbo = gl.createFramebuffer();
 
 const qb = gl.createBuffer();
@@ -94,7 +104,7 @@ precision highp float;
 precision highp sampler3D;
 in vec2 uv; out vec4 fragColor;
 uniform sampler3D uD;
-uniform float a[24]; // 4 per transform, up to 6
+uniform float a[48]; // 8 per transform, up to 6
 uniform float sliceZ; // normalized z of current slice [0,1]
 uniform int nT;
 uniform float cw;
@@ -111,6 +121,15 @@ vec3 colorWeight(int t){
   return vec3(1.0,cw,cw);
 }
 
+mat3 rotMat(float rx, float ry, float rz){
+  float cx=cos(rx),sx=sin(rx),cy=cos(ry),sy=sin(ry),cz=cos(rz),sz=sin(rz);
+  return mat3(
+    vec3(cy*cz, cy*sz, -sy),
+    vec3(sx*sy*cz-cx*sz, sx*sy*sz+cx*cz, sx*cy),
+    vec3(cx*sy*cz+sx*sz, cx*sy*sz-sx*cz, cx*cy)
+  );
+}
+
 void main(){
   // World position in unit ball coords [-1,1]^3
   vec3 w = vec3(uv * 2.0 - 1.0, sliceZ * 2.0 - 1.0);
@@ -121,18 +140,21 @@ void main(){
 
   for(int t = 0; t < 6; t++){
     if(t >= nT) break;
-    int b = t * 4;
+    int b = t * 8;
     vec3 c = vec3(0.35*sin(a[b]), 0.35*sin(a[b+1]), 0.35*sin(a[b+2]));
     float rho = clamp((0.1 + 0.2*(0.5+0.5*sin(a[b+3]))) * holeMul, 0.02, 0.7);
 
-    vec3 d = w - c;
+    // Rotate w before blowup (backward: apply inverse rotation = transpose)
+    mat3 R = rotMat(a[b+4], a[b+5], a[b+6]);
+    vec3 d = transpose(R) * (w - c);
     float r = length(d);
     if(r < rho) continue; // inside hole — no contribution
 
-    // Radial collapse: map shell [rho, ~1] -> [0, ~1] around c
+    // Radial collapse in rotated frame, then rotate back
     float tVal = (r - rho) / max(1.0 - rho, 0.01);
-    float R = pow(max(tVal, 1e-6), bias);
-    vec3 z = c + (d / max(r, 1e-6)) * R;
+    float Rc = pow(max(tVal, 1e-6), bias);
+    vec3 collapsed = (d / max(r, 1e-6)) * Rc;
+    vec3 z = c + R * collapsed; // rotate back to world
 
     if(dot(z,z) > 1.0) continue; // outside ball
 
@@ -167,6 +189,8 @@ uniform vec3 uCamRight;
 uniform vec3 uCamUp;
 uniform vec3 uCamFwd;
 uniform float uDensity;
+uniform float uFov;
+uniform float uVoxSize;
 
 vec2 sphereHit(vec3 ro, vec3 rd){
   float b = dot(ro, rd);
@@ -179,7 +203,7 @@ vec2 sphereHit(vec3 ro, vec3 rd){
 
 void main(){
   vec2 ndc = uv * 2.0 - 1.0;
-  vec3 rd = normalize(uCamFwd + ndc.x * uCamRight * 0.6 + ndc.y * uCamUp * 0.6);
+  vec3 rd = normalize(uCamFwd + ndc.x * uCamRight * uFov + ndc.y * uCamUp * uFov);
   vec3 ro = uCamPos;
 
   vec2 t = sphereHit(ro, rd);
@@ -190,11 +214,14 @@ void main(){
 
   const int STEPS = 80;
   float dt = (tFar - tNear) / float(STEPS);
+  // Jitter ray start to break up banding
+  float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(127.1, 311.7))) * 43758.5453);
+  tNear += jitter * dt;
   vec3 col = vec3(0.0);
   float alpha = 0.0;
 
   vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
-  float eps = 1.0 / 64.0;
+  float eps = uVoxSize;
 
   for(int i = 0; i < STEPS; i++){
     float tc = tNear + (float(i) + 0.5) * dt;
@@ -232,16 +259,16 @@ void main(){
 }`);
 
 // Parameters
-const NPARAMS = 24; // 4 per transform × 6 max
+const NPARAMS = 48; // 8 per transform × 6 max
 const rng = (function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
 const baseAngles = new Float32Array(NPARAMS), vels = new Float32Array(NPARAMS), phases = new Float32Array(NPARAMS);
 for (let i = 0; i < NPARAMS; i++) { baseAngles[i] = rng()*Math.PI*2; vels[i] = (rng()-0.5)*0.4; }
 
-let nFuncs = 4, pp = 0, frame = 0, lastT = performance.now(), fpsS = 0;
+let nFuncs = 4, pp = 0, frame = 0, fpsS = 0, fpsLastTime = 0;
 const runAvg = [1, 1, 1];
 
 // Camera
-let camAz = 0, camEl = 0.3, camAutoRot = true;
+let camAz = 0, camEl = 0.3, camDist = 2.2, camAutoRot = true;
 let mDown = false, mLX, mLY;
 canvas.addEventListener('mousedown', e => { mDown = true; mLX = e.clientX; mLY = e.clientY; camAutoRot = false; });
 window.addEventListener('mouseup', () => mDown = false);
@@ -251,6 +278,10 @@ canvas.addEventListener('mousemove', e => {
   camEl = Math.max(-1.2, Math.min(1.2, camEl + (e.clientY - mLY) * 0.01));
   mLX = e.clientX; mLY = e.clientY;
 });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  camDist = Math.max(1.2, Math.min(6.0, camDist * (1 + e.deltaY * 0.001)));
+}, {passive: false});
 canvas.addEventListener('dblclick', () => { camAutoRot = true; });
 
 function drawQ(p) {
@@ -263,10 +294,19 @@ function drawQ(p) {
 
 function resetImage() {
   frame = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
+  init3D = makeInitData(N);
   for (const t of [texA, texB]) {
     gl.bindTexture(gl.TEXTURE_3D, t);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, N, N, N, 0, gl.RGBA, gl.FLOAT, init3D);
   }
+}
+
+function changeResolution(newN) {
+  N = newN;
+  gl.deleteTexture(texA); gl.deleteTexture(texB);
+  init3D = makeInitData(N);
+  texA = makeTex3D(N, init3D); texB = makeTex3D(N, init3D);
+  frame = 0; pp = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
 }
 
 function doIter(ang) {
@@ -323,11 +363,10 @@ function norm3(v) { const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [
 function cross3(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
 
 function display() {
-  const dist = 2.8;
   const cp = [
-    Math.sin(camAz) * Math.cos(camEl) * dist,
-    Math.sin(camEl) * dist,
-    Math.cos(camAz) * Math.cos(camEl) * dist
+    Math.sin(camAz) * Math.cos(camEl) * camDist,
+    Math.sin(camEl) * camDist,
+    Math.cos(camAz) * Math.cos(camEl) * camDist
   ];
   const fwd = norm3([-cp[0], -cp[1], -cp[2]]);
   const right = norm3(cross3(fwd, [0, 1, 0]));
@@ -344,6 +383,8 @@ function display() {
   gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamUp'), up);
   gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamFwd'), fwd);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uDensity'), document.getElementById('density').value / 10.0);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uFov'), 1.0 / camDist);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uVoxSize'), 1.0 / N);
   drawQ(dispProg);
 }
 
@@ -353,6 +394,9 @@ document.getElementById('randomize').addEventListener('click', function(){
 });
 document.getElementById('nfuncs').addEventListener('change', function(){
   nFuncs = parseInt(this.value); resetImage();
+});
+document.getElementById('voxres').addEventListener('change', function(){
+  changeResolution(parseInt(this.value));
 });
 
 function loop() {
@@ -368,9 +412,13 @@ function loop() {
   display();
 
   frame++;
-  const now = performance.now(), el = now - lastT; lastT = now;
-  fpsS = fpsS * 0.95 + (1000/el) * 0.05;
-  if (frame % 30 === 0) document.getElementById('fps').textContent = fpsS.toFixed(0) + ' fps';
+  if (frame % 30 === 0) {
+    gl.finish();
+    const now = performance.now();
+    if (fpsLastTime > 0) fpsS = 30000 / (now - fpsLastTime);
+    fpsLastTime = now;
+    document.getElementById('fps').textContent = fpsS.toFixed(0) + ' fps';
+  }
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
