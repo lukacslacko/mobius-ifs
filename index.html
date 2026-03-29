@@ -28,10 +28,18 @@
   <label>Num°: <select id="numdeg">
     <option value="0">0</option><option value="1">1</option>
     <option value="2">2</option><option value="3" selected>3</option><option value="4">4</option>
+    <option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option>
+    <option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
+    <option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option>
+    <option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option>
   </select></label>
   <label>Den°: <select id="dendeg">
     <option value="0">0</option><option value="1" selected>1</option>
     <option value="2">2</option><option value="3">3</option><option value="4">4</option>
+    <option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option>
+    <option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
+    <option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option>
+    <option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option>
   </select></label>
   <label>Samples: <select id="nsamp">
     <option value="6">6×6</option><option value="9">9×9</option>
@@ -112,7 +120,7 @@ const iterProg = pr(VS, `#version 300 es
 precision highp float;
 in vec2 uv; out vec4 fragColor;
 uniform sampler2D uD;
-uniform float a[60]; // up to 6 transforms × 10 coefficients
+uniform float a[252]; // up to 6 transforms × 42 coefficients
 uniform float sc;
 uniform float pixSize;
 uniform int nT;
@@ -126,7 +134,7 @@ vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
 // p(w) = c0·w^deg + c1·w^(deg-1) + ... + c_deg  (Horner's method)
 vec2 evalPoly(vec2 w, int off, int deg) {
   vec2 r = vec2(cos(a[off]), sin(a[off]));
-  for (int k=1; k<=4; k++) {
+  for (int k=1; k<=20; k++) {
     if (k > deg) break;
     r = cm(r, w) + vec2(cos(a[off+k]), sin(a[off+k]));
   }
@@ -138,7 +146,7 @@ vec2 evalPolyDeriv(vec2 w, int off, int deg) {
   if (deg == 0) return vec2(0.0);
   // Horner for derivative coefficients
   vec2 r = vec2(cos(a[off]), sin(a[off])) * float(deg);
-  for (int k=1; k<=3; k++) {
+  for (int k=1; k<=19; k++) {
     if (k >= deg) break;
     r = cm(r, w) + vec2(cos(a[off+k]), sin(a[off+k])) * float(deg - k);
   }
@@ -162,7 +170,7 @@ vec3 sampleAt(vec2 w){
   vec3 wTotal = vec3(0.0);
   for(int t=0;t<6;t++){
     if(t>=nT) break;
-    int base = t * 10; // 10 slots per transform (max 5+5)
+    int base = t * 42; // 42 slots per transform (max 21+21)
     int numOff = base;
     int denOff = base + numDeg + 1;
 
@@ -238,12 +246,12 @@ void main(){
 }`);
 
 const rng=(function(s){return function(){s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};})(42);
-const baseAngles=new Float32Array(60), vels=new Float32Array(60);
-for(let i=0;i<60;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
+const baseAngles=new Float32Array(252), vels=new Float32Array(252);
+for(let i=0;i<252;i++){baseAngles[i]=rng()*Math.PI*2; vels[i]=(rng()-0.5)*0.4;}
 
 let nFuncs=3, pp=0, frame=0, lastT=performance.now(), fpsS=0;
 const logMax=new Float32Array([1,1,1]);
-const phases=new Float32Array(60);
+const phases=new Float32Array(252);
 const runAvg=[1,1,1]; // smoothed running average per channel
 
 function drawQ(p){
@@ -353,7 +361,7 @@ function display(){
 }
 
 document.getElementById('randomize').addEventListener('click', function(){
-  for(let i=0;i<60;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
+  for(let i=0;i<252;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4; phases[i]=0;}
   resetImage();
 });
 document.getElementById('nfuncs').addEventListener('change', function(){
@@ -365,9 +373,9 @@ document.getElementById('dendeg').addEventListener('change', function(){ resetIm
 function loop(){
   const speedPct=document.getElementById('speed').value/100.0;
   const dt=1.0/60.0;
-  for(let i=0;i<60;i++) phases[i]+=vels[i]*dt*speedPct;
-  const ang=new Float32Array(60);
-  for(let i=0;i<60;i++) ang[i]=baseAngles[i]+phases[i];
+  for(let i=0;i<252;i++) phases[i]+=vels[i]*dt*speedPct;
+  const ang=new Float32Array(252);
+  for(let i=0;i<252;i++) ang[i]=baseAngles[i]+phases[i];
   doIter(ang);
   display();
   if(frame%100===0){
