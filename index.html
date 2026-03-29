@@ -33,6 +33,11 @@
     <option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option>
     <option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option>
   </select></label>
+  <label>Num^: <select id="numexp">
+    <option value="1" selected>1</option><option value="2">2</option><option value="3">3</option>
+    <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+    <option value="7">7</option><option value="8">8</option>
+  </select></label>
   <label>Den°: <select id="dendeg">
     <option value="0">0</option><option value="1" selected>1</option>
     <option value="2">2</option><option value="3">3</option><option value="4">4</option>
@@ -40,6 +45,11 @@
     <option value="9">9</option><option value="10">10</option><option value="11">11</option><option value="12">12</option>
     <option value="13">13</option><option value="14">14</option><option value="15">15</option><option value="16">16</option>
     <option value="17">17</option><option value="18">18</option><option value="19">19</option><option value="20">20</option>
+  </select></label>
+  <label>Den^: <select id="denexp">
+    <option value="1" selected>1</option><option value="2">2</option><option value="3">3</option>
+    <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+    <option value="7">7</option><option value="8">8</option>
   </select></label>
   <label>Samples: <select id="nsamp">
     <option value="6">6×6</option><option value="9">9×9</option>
@@ -127,8 +137,22 @@ uniform int nT;
 uniform float cw;
 uniform int numDeg; // numerator degree 0-4
 uniform int denDeg; // denominator degree 0-4
+uniform int numExp; // numerator exponent
+uniform int denExp; // denominator exponent
 
 vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
+
+// Complex integer power
+vec2 cpow(vec2 z, int n) {
+  if (n == 0) return vec2(1.0, 0.0);
+  if (n == 1) return z;
+  vec2 r = vec2(1.0, 0.0);
+  for (int i = 0; i < 8; i++) {
+    if (i >= n) break;
+    r = cm(r, z);
+  }
+  return r;
+}
 
 // Evaluate polynomial of degree deg with coefficients starting at a[off]
 // p(w) = c0·w^deg + c1·w^(deg-1) + ... + c_deg  (Horner's method)
@@ -174,15 +198,21 @@ vec3 sampleAt(vec2 w){
     int numOff = base;
     int denOff = base + numDeg + 1;
 
-    vec2 n = evalPoly(w, numOff, numDeg);
-    vec2 d = evalPoly(w, denOff, denDeg);
-    float ds = max(dot(d,d), 1e-10);
-    vec2 z = vec2(dot(n,d)/ds, (n.y*d.x - n.x*d.y)/ds);
+    vec2 P = evalPoly(w, numOff, numDeg);
+    vec2 Q = evalPoly(w, denOff, denDeg);
+    // N = P^a, D = Q^b
+    vec2 N = cpow(P, numExp);
+    vec2 D = cpow(Q, denExp);
+    float ds = max(dot(D,D), 1e-10);
+    vec2 z = vec2(dot(N,D)/ds, (N.y*D.x - N.x*D.y)/ds);
 
-    // Jacobian: |f'|² = |n'd - nd'|² / |d|⁴
-    vec2 np = evalPolyDeriv(w, numOff, numDeg);
-    vec2 dp = evalPolyDeriv(w, denOff, denDeg);
-    vec2 deriv_num = cm(np,d) - cm(n,dp);
+    // Jacobian: f = P^a / Q^b, f' = (N'D - ND') / D²
+    // where N' = a·P^(a-1)·P', D' = b·Q^(b-1)·Q'
+    vec2 Pp = evalPolyDeriv(w, numOff, numDeg);
+    vec2 Qp = evalPolyDeriv(w, denOff, denDeg);
+    vec2 Np = cm(cpow(P, numExp-1), Pp) * float(numExp);
+    vec2 Dp = cm(cpow(Q, denExp-1), Qp) * float(denExp);
+    vec2 deriv_num = cm(Np, D) - cm(N, Dp);
     float j = min(dot(deriv_num,deriv_num) / (ds*ds), 10.0);
 
     if(dot(z,z) <= R2){
@@ -288,6 +318,8 @@ function doIter(ang){
   gl.uniform1f(gl.getUniformLocation(iterProg,'cw'),document.getElementById('colorwt').value/100.0);
   gl.uniform1i(gl.getUniformLocation(iterProg,'numDeg'),parseInt(document.getElementById('numdeg').value));
   gl.uniform1i(gl.getUniformLocation(iterProg,'denDeg'),parseInt(document.getElementById('dendeg').value));
+  gl.uniform1i(gl.getUniformLocation(iterProg,'numExp'),parseInt(document.getElementById('numexp').value));
+  gl.uniform1i(gl.getUniformLocation(iterProg,'denExp'),parseInt(document.getElementById('denexp').value));
   drawQ(iterProg);
 
   // Fast per-channel normalization: few samples, smoothed tracking
@@ -369,6 +401,8 @@ document.getElementById('nfuncs').addEventListener('change', function(){
 });
 document.getElementById('numdeg').addEventListener('change', function(){ resetImage(); });
 document.getElementById('dendeg').addEventListener('change', function(){ resetImage(); });
+document.getElementById('numexp').addEventListener('change', function(){ resetImage(); });
+document.getElementById('denexp').addEventListener('change', function(){ resetImage(); });
 
 function loop(){
   const speedPct=document.getElementById('speed').value/100.0;
