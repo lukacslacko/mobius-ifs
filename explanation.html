@@ -2,11 +2,11 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Möbius IFS — General</title>
+<title>Möbius IFS — Explanation</title>
 <style>
   * { margin: 0; padding: 0; }
   body { background: #000; overflow: hidden; font-family: monospace; }
-  canvas { display: block; margin: auto; position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  canvas { display: block; }
   .controls {
     position: fixed; top: 10px; left: 10px; z-index: 10;
     background: rgba(0,0,0,0.7); padding: 10px 14px; border-radius: 6px;
@@ -64,8 +64,7 @@
   </select></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
-  <label><input type="checkbox" id="showpermap"> Explanation</label>
-  <label id="gridlabel" style="display:none"><input type="checkbox" id="showgrid" checked> Grid</label>
+  <label><input type="checkbox" id="showgrid" checked> Grid</label>
   <button id="randomize">Randomize</button>
   <span id="fps"></span>
 </div>
@@ -74,25 +73,10 @@
 <script>
 const canvas = document.getElementById('c');
 let initialized = false;
-
-// Initial SIZE based on window (matches original single-disc quality)
-const SIZE = Math.min(window.innerWidth, window.innerHeight);
-const SCALE = 4.0;
-
 function resize() {
-  const multi = initialized && document.getElementById('showpermap').checked;
-  if (multi) {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    canvas.style.width = window.innerWidth + 'px';
-    canvas.style.height = window.innerHeight + 'px';
-    updateLabels();
-  } else {
-    const s = Math.min(window.innerWidth, window.innerHeight);
-    canvas.width = s; canvas.height = s;
-    canvas.style.width = s + 'px'; canvas.style.height = s + 'px';
-    if (initialized) clearLabels();
-  }
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  if (initialized) updateLabels();
 }
 resize();
 window.addEventListener('resize', resize);
@@ -100,6 +84,9 @@ window.addEventListener('resize', resize);
 const gl = canvas.getContext('webgl2');
 gl.getExtension('EXT_color_buffer_float');
 gl.getExtension('OES_texture_float_linear');
+
+const SIZE = 512;
+const SCALE = 4.0;
 
 function makeTex() {
   const t = gl.createTexture();
@@ -156,6 +143,7 @@ uniform int numExp;
 uniform int denExp;
 uniform int singleT;
 uniform int doAA;
+uniform int extendSrc;
 
 vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
 
@@ -225,7 +213,7 @@ vec3 sampleAt(vec2 w){
     vec2 deriv_num = cm(Np, D) - cm(N, Dp);
     float j = min(dot(deriv_num,deriv_num) / (ds*ds), 10.0);
 
-    if(dot(z,z) <= R2){
+    if(extendSrc == 1 || dot(z,z) <= R2){
       vec2 s = z/sc + 0.5;
       vec3 sampled = texture(uD, s).rgb;
       vec3 cwt = colorWeight(t);
@@ -280,7 +268,6 @@ uniform float uG;
 uniform vec3 uTint;
 uniform int uGrid;
 uniform float uSc;
-uniform int uBorder;
 void main(){
   vec2 c = uv - 0.5;
   float r2 = dot(c,c);
@@ -290,10 +277,9 @@ void main(){
   v.r = uLM.r>0.001 ? pow(clamp(log(1.0+abs(d.r))/uLM.r,0.0,1.0),uG) : 0.0;
   v.g = uLM.g>0.001 ? pow(clamp(log(1.0+abs(d.g))/uLM.g,0.0,1.0),uG) : 0.0;
   v.b = uLM.b>0.001 ? pow(clamp(log(1.0+abs(d.b))/uLM.b,0.0,1.0),uG) : 0.0;
-  if (uBorder == 1) {
-    float edge = smoothstep(0.0, 0.003, 0.5 - sqrt(r2));
-    v = mix(vec3(0.35), v, edge);
-  }
+  // Disc boundary ring
+  float edge = smoothstep(0.0, 0.003, 0.5 - sqrt(r2));
+  v = mix(vec3(0.35), v, edge);
   if (uGrid == 1) {
     vec2 w = (uv - 0.5) * uSc;
     float spacing = uSc / 16.0;
@@ -335,7 +321,7 @@ const phases=new Float32Array(252);
 const runAvg=[1,1,1];
 let currentAng=new Float32Array(252);
 
-/* ---- Multi-disc layout ---- */
+/* ---- Grid layout ---- */
 
 function gridDims(n) {
   if (n <= 3) return [n, 1];
@@ -381,15 +367,11 @@ function updateLabels() {
     lbl.style.top   = (cell.cssY + cell.size + 2) + 'px';
     lbl.style.width  = cell.size + 'px';
     lbl.style.color  = labelColors[i];
-    lbl.textContent  = i === 0 ? 'Combined' : String.fromCharCode(0x66) + String.fromCharCode(0x2080+i) + ' (' + colorTags[i] + ')';
+    lbl.textContent  = i === 0 ? 'Combined' : 'f\u2080'.replace('\u2080',String.fromCharCode(0x2080+i)) + ' (' + colorTags[i] + ')';
     container.appendChild(lbl);
   }
 }
-
-function clearLabels() {
-  document.getElementById('labels').innerHTML = '';
-}
-
+updateLabels();
 initialized = true;
 
 /* ---- Drawing helpers ---- */
@@ -413,9 +395,9 @@ function resetImage(){
   logMax[0]=1; logMax[1]=1; logMax[2]=1;
 }
 
-/* ---- Iteration ---- */
+/* ---- Iteration (same logic as index.html, singleT=-1, doAA=1) ---- */
 
-function setIterUniforms(srcTex, ang, st, aa) {
+function setIterUniforms(srcTex, ang, st, aa, ext) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, srcTex);
   gl.uniform1i(gl.getUniformLocation(iterProg,'uD'),0);
@@ -430,6 +412,7 @@ function setIterUniforms(srcTex, ang, st, aa) {
   gl.uniform1i(gl.getUniformLocation(iterProg,'denExp'),parseInt(document.getElementById('denexp').value));
   gl.uniform1i(gl.getUniformLocation(iterProg,'singleT'),st);
   gl.uniform1i(gl.getUniformLocation(iterProg,'doAA'),aa);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'extendSrc'),ext||0);
 }
 
 function doIter(ang){
@@ -473,7 +456,9 @@ function doIter(ang){
 
 /* ---- Display ---- */
 
-function setDispUniforms(tex, tint, grid, border) {
+function displayDisc(tex, cell, tint, grid) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(cell.glX, cell.glY, cell.size, cell.size);
   gl.useProgram(dispProg);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -483,17 +468,11 @@ function setDispUniforms(tex, tint, grid, border) {
   gl.uniform3fv(gl.getUniformLocation(dispProg,'uTint'),tint);
   gl.uniform1i(gl.getUniformLocation(dispProg,'uGrid'),grid?1:0);
   gl.uniform1f(gl.getUniformLocation(dispProg,'uSc'),SCALE);
-  gl.uniform1i(gl.getUniformLocation(dispProg,'uBorder'),border?1:0);
-}
-
-function displayDisc(tex, cell, tint, grid) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(cell.glX, cell.glY, cell.size, cell.size);
-  setDispUniforms(tex, tint, grid, true);
   drawQ(dispProg);
 }
 
 function display(){
+  const layout = getLayout();
   const srcTex = pp===0?texA:texB;
 
   // Update logMax from combined image
@@ -516,25 +495,13 @@ function display(){
     }
   }
 
-  const multiDisc = document.getElementById('showpermap').checked;
-
-  if (!multiDisc) {
-    // Single disc — original behavior
-    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
-    gl.viewport(0,0,canvas.width,canvas.height);
-    setDispUniforms(srcTex, new Float32Array([1,1,1]), false, false);
-    drawQ(dispProg);
-    return;
-  }
-
-  // Multi-disc mode
-  const layout = getLayout();
-
+  // Clear canvas
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0,0,0,1);
   gl.clear(gl.COLOR_BUFFER_BIT);
 
+  // Per-transform setup
   const gridOn = document.getElementById('showgrid').checked;
   const cwVal = parseFloat(document.getElementById('colorwt').value)/100.0;
   const cwts = [
@@ -542,7 +509,7 @@ function display(){
     [cwVal,cwVal,1],[cwVal,1,cwVal],[1,cwVal,cwVal]
   ];
 
-  // Render gridded source once if grid is on
+  // Render gridded source once if grid is on (for per-transform warping)
   let perTransformSrc = srcTex;
   if (gridOn) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fboC);
@@ -556,17 +523,18 @@ function display(){
     perTransformSrc = texC;
   }
 
-  // Combined disc
+  // Main combined disc (grid overlay drawn in display space)
   displayDisc(srcTex, layout.cells[0], new Float32Array([1,1,1]), gridOn);
 
-  // Per-transform discs
   for (let t = 0; t < nFuncs; t++) {
+    // Render single transform to texT
     gl.bindFramebuffer(gl.FRAMEBUFFER, fboT);
     gl.viewport(0, 0, SIZE, SIZE);
     gl.useProgram(iterProg);
     setIterUniforms(perTransformSrc, currentAng, t, 0);
     drawQ(iterProg);
 
+    // Display with proportional tint (raw color weight, log compresses it)
     displayDisc(texT, layout.cells[t+1], new Float32Array(cwts[t]), false);
   }
 }
@@ -578,17 +546,12 @@ document.getElementById('randomize').addEventListener('click', function(){
   resetImage();
 });
 document.getElementById('nfuncs').addEventListener('change', function(){
-  nFuncs=parseInt(this.value); resetImage();
-  if (document.getElementById('showpermap').checked) updateLabels();
+  nFuncs=parseInt(this.value); resetImage(); updateLabels();
 });
 document.getElementById('numdeg').addEventListener('change', function(){ resetImage(); });
 document.getElementById('dendeg').addEventListener('change', function(){ resetImage(); });
 document.getElementById('numexp').addEventListener('change', function(){ resetImage(); });
 document.getElementById('denexp').addEventListener('change', function(){ resetImage(); });
-document.getElementById('showpermap').addEventListener('change', function(){
-  document.getElementById('gridlabel').style.display = this.checked ? '' : 'none';
-  resize();
-});
 
 /* ---- Main loop ---- */
 
@@ -600,17 +563,6 @@ function loop(){
   for(let i=0;i<252;i++) currentAng[i]=baseAngles[i]+phases[i];
   doIter(currentAng);
   display();
-  if(frame%100===0){
-    const rFBO=pp===0?fboA:fboB;
-    gl.bindFramebuffer(gl.FRAMEBUFFER,rFBO);
-    const b=new Float32Array(4); let s=[0,0,0],n=0;
-    const st2=Math.floor(SIZE/8);
-    for(let y=0;y<SIZE;y+=st2)for(let x=0;x<SIZE;x+=st2){
-      gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b);s[0]+=b[0];s[1]+=b[1];s[2]+=b[2];n++;
-    }
-    console.log('frame '+frame+': avg R='+(s[0]/n).toExponential(2)+' G='+(s[1]/n).toExponential(2)+' B='+(s[2]/n).toExponential(2)+' runAvg=['+runAvg[0].toFixed(3)+','+runAvg[1].toFixed(3)+','+runAvg[2].toFixed(3)+']');
-    gl.bindFramebuffer(gl.FRAMEBUFFER,null);
-  }
   frame++;
   const now=performance.now(),el=now-lastT; lastT=now;
   fpsS=fpsS*0.95+(1000/el)*0.05;
