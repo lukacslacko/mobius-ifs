@@ -21,8 +21,8 @@
 <body>
 <div class="controls">
   <label>Funcs: <select id="nfuncs">
-    <option value="1">1</option><option value="2" selected>2</option>
-    <option value="3">3</option><option value="4">4</option>
+    <option value="1">1</option><option value="2">2</option>
+    <option value="3" selected>3</option><option value="4">4</option>
     <option value="5">5</option><option value="6">6</option>
   </select></label>
   <label>Voxels: <select id="voxres">
@@ -32,7 +32,12 @@
     <option value="256">256</option><option value="384" selected>384</option>
     <option value="512">512</option>
   </select></label>
-  <label>Density: <input type="range" id="density" min="1" max="400" value="80"></label>
+  <label>Render: <select id="rendermode">
+    <option value="volume">Volume</option>
+    <option value="surface" selected>Surface</option>
+  </select></label>
+  <label id="densitylabel" style="display:none">Density: <input type="range" id="density" min="1" max="400" value="80"></label>
+  <label id="thresholdlabel">Threshold: <input type="range" id="threshold" min="0" max="100" value="50"></label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <button id="randomize">Randomize</button>
@@ -195,6 +200,8 @@ uniform vec3 uCamFwd;
 uniform float uDensity;
 uniform float uFov;
 uniform float uVoxSize;
+uniform int uMode; // 0=volume, 1=surface
+uniform float uThreshold;
 
 vec2 sphereHit(vec3 ro, vec3 rd){
   float b = dot(ro, rd);
@@ -216,16 +223,47 @@ void main(){
   float tNear = max(t.x, 0.0);
   float tFar = t.y;
 
-  const int STEPS = 80;
+  const int STEPS = 120;
   float dt = (tFar - tNear) / float(STEPS);
   float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(127.1, 311.7))) * 43758.5453);
   tNear += jitter * dt;
-  vec3 col = vec3(0.0);
-  float alpha = 0.0;
 
   vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
   float eps = uVoxSize;
 
+  if (uMode == 1) {
+    // Surface mode: stop at first voxel above threshold
+    for(int i = 0; i < STEPS; i++){
+      float tc = tNear + (float(i) + 0.5) * dt;
+      vec3 pos = ro + rd * tc;
+      vec3 uvw = pos * 0.5 + 0.5;
+      vec3 d = texture(uVol, uvw).rgb;
+      float dens = (d.r + d.g + d.b) / 3.0;
+      if(dens < uThreshold) continue;
+
+      // Compute gradient normal
+      vec3 gr;
+      gr.x = texture(uVol, uvw+vec3(eps,0,0)).r - texture(uVol, uvw-vec3(eps,0,0)).r;
+      gr.y = texture(uVol, uvw+vec3(0,eps,0)).r - texture(uVol, uvw-vec3(0,eps,0)).r;
+      gr.z = texture(uVol, uvw+vec3(0,0,eps)).r - texture(uVol, uvw-vec3(0,0,eps)).r;
+      float gl2 = dot(gr, gr);
+      vec3 c = d / max(dens, 0.001);
+      if(gl2 > 0.0001){
+        vec3 n = gr / sqrt(gl2);
+        float diff = max(dot(n, lightDir), 0.0) * 0.7 + 0.3;
+        float spec = pow(max(dot(reflect(-lightDir, n), -rd), 0.0), 16.0) * 0.3;
+        c = c * diff + vec3(spec);
+      }
+      fragColor = vec4(pow(max(c, vec3(0.0)), vec3(0.45)), 1.0);
+      return;
+    }
+    fragColor = vec4(0,0,0,1);
+    return;
+  }
+
+  // Volume mode
+  vec3 col = vec3(0.0);
+  float alpha = 0.0;
   for(int i = 0; i < STEPS; i++){
     float tc = tNear + (float(i) + 0.5) * dt;
     vec3 pos = ro + rd * tc;
@@ -287,7 +325,7 @@ const NPARAMS = 96;
 const baseAngles = new Float32Array(NPARAMS), vels = new Float32Array(NPARAMS), phases = new Float32Array(NPARAMS);
 for (let i = 0; i < NPARAMS; i++) { baseAngles[i] = Math.random()*Math.PI*2; vels[i] = (Math.random()-0.5)*0.4; }
 
-let nFuncs = 2, pp = 0, frame = 0, fpsS = 0, fpsLastTime = 0;
+let nFuncs = 3, pp = 0, frame = 0, fpsS = 0, fpsLastTime = 0;
 const runAvg = [1, 1, 1];
 
 let camAz = 0, camEl = 0.3, camDist = 2.2, camAutoRot = true;
@@ -352,6 +390,8 @@ function drawQ(p) {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
+let quantileThreshold = 0.1;
+
 function resetImage() {
   frame = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
   init3D = makeInitData(N);
@@ -411,6 +451,29 @@ function doIter(ang) {
         runAvg[c] = runAvg[c] * 0.95 + desired * 0.05;
       }
     } else if (frame > 10) { resetImage(); pp = 1 - pp; return; }
+
+    // Histogram for quantile threshold — sample a sparse grid across 3 slices
+    const samples = [];
+    const step = Math.max(Math.floor(N / 16), 1);
+    const slices = [Math.floor(N*0.25), midZ, Math.floor(N*0.75)];
+    for (const sz2 of slices) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, writeTex, 0, sz2);
+      const row = new Float32Array(N * 4);
+      for (let y = 0; y < N; y += step) {
+        gl.readPixels(0, y, N, 1, gl.RGBA, gl.FLOAT, row);
+        for (let x = 0; x < N; x += step) {
+          const lum = (row[x*4] + row[x*4+1] + row[x*4+2]) / 3;
+          if (isFinite(lum) && lum > 0.01) samples.push(lum);
+        }
+      }
+    }
+    if (samples.length > 10) {
+      samples.sort((a, b) => a - b);
+      const pct = document.getElementById('threshold').value / 100;
+      const idx = Math.min(Math.floor(pct * samples.length), samples.length - 1);
+      const target = samples[idx];
+      quantileThreshold = quantileThreshold * 0.7 + target * 0.3;
+    }
   }
 
   pp = 1 - pp;
@@ -450,6 +513,9 @@ function display() {
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uDensity'), document.getElementById('density').value / 10.0);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uFov'), 1.0 / camDist);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uVoxSize'), 1.0 / N);
+  const surfMode = document.getElementById('rendermode').value === 'surface' ? 1 : 0;
+  gl.uniform1i(gl.getUniformLocation(dispProg, 'uMode'), surfMode);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uThreshold'), quantileThreshold);
   drawQ(dispProg);
 
   // Right: i-j plane slice (k=0, i.e. z=0.5 in texture coords)
@@ -495,6 +561,10 @@ document.getElementById('nfuncs').addEventListener('change', function(){
 });
 document.getElementById('voxres').addEventListener('change', function(){
   changeResolution(parseInt(this.value));
+});
+document.getElementById('rendermode').addEventListener('change', function(){
+  document.getElementById('densitylabel').style.display = this.value === 'volume' ? '' : 'none';
+  document.getElementById('thresholdlabel').style.display = this.value === 'surface' ? '' : 'none';
 });
 
 function loop() {
