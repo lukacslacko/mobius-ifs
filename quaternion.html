@@ -73,19 +73,28 @@ function makeTex3D(n, data) {
   return t;
 }
 
-function makeInitData(n) {
-  const d = new Float32Array(n*n*n*4);
-  for (let i = 0; i < n*n*n; i++) {
-    const ix = i % n, iy = Math.floor(i / n) % n, iz = Math.floor(i / (n*n));
-    const x = (ix+0.5)/n*2-1, y = (iy+0.5)/n*2-1, z = (iz+0.5)/n*2-1;
-    const v = x*x+y*y+z*z < 1.0 ? 1.0 : 0.001;
-    d[i*4]=v; d[i*4+1]=v; d[i*4+2]=v; d[i*4+3]=1;
+function initTex3D(tex, n) {
+  // Fill slice by slice to avoid huge allocation
+  gl.bindTexture(gl.TEXTURE_3D, tex);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, n, n, n, 0, gl.RGBA, gl.FLOAT, null);
+  const slice = new Float32Array(n * n * 4);
+  for (let iz = 0; iz < n; iz++) {
+    const z = (iz + 0.5) / n * 2 - 1;
+    for (let iy = 0; iy < n; iy++) {
+      const y = (iy + 0.5) / n * 2 - 1;
+      for (let ix = 0; ix < n; ix++) {
+        const x = (ix + 0.5) / n * 2 - 1;
+        const v = x*x + y*y + z*z < 1.0 ? 1.0 : 0.001;
+        const j = (iy * n + ix) * 4;
+        slice[j] = v; slice[j+1] = v; slice[j+2] = v; slice[j+3] = 1;
+      }
+    }
+    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, iz, n, n, 1, gl.RGBA, gl.FLOAT, slice);
   }
-  return d;
 }
 
-let init3D = makeInitData(N);
-let texA = makeTex3D(N, init3D), texB = makeTex3D(N, init3D);
+let texA = makeTex3D(N, null), texB = makeTex3D(N, null);
+initTex3D(texA, N); initTex3D(texB, N);
 const fbo = gl.createFramebuffer();
 
 const qb = gl.createBuffer();
@@ -394,18 +403,14 @@ let quantileThreshold = 0.1;
 
 function resetImage() {
   frame = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
-  init3D = makeInitData(N);
-  for (const t of [texA, texB]) {
-    gl.bindTexture(gl.TEXTURE_3D, t);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA32F, N, N, N, 0, gl.RGBA, gl.FLOAT, init3D);
-  }
+  initTex3D(texA, N); initTex3D(texB, N);
 }
 
 function changeResolution(newN) {
   N = newN;
   gl.deleteTexture(texA); gl.deleteTexture(texB);
-  init3D = makeInitData(N);
-  texA = makeTex3D(N, init3D); texB = makeTex3D(N, init3D);
+  texA = makeTex3D(N, null); texB = makeTex3D(N, null);
+  initTex3D(texA, N); initTex3D(texB, N);
   frame = 0; pp = 0; runAvg[0] = 1; runAvg[1] = 1; runAvg[2] = 1;
 }
 
