@@ -26,8 +26,8 @@
 <body>
 <div class="controls">
   <label>Funcs: <select id="nfuncs">
-    <option value="1">1</option><option value="2">2</option>
-    <option value="3" selected>3</option><option value="4">4</option>
+    <option value="1">1</option><option value="2" selected>2</option>
+    <option value="3">3</option><option value="4">4</option>
     <option value="5">5</option><option value="6">6</option>
   </select></label>
   <label>Num°: <select id="numdeg">
@@ -67,6 +67,16 @@
   <label><input type="checkbox" id="showpermap"> Components</label>
   <label id="gridlabel" style="display:none"><input type="checkbox" id="showgrid" checked> Grid</label>
   <button id="randomize">Randomize</button>
+  <details style="border-top:1px solid #555; margin-top:4px; padding-top:4px;">
+    <summary style="cursor:pointer;">Annoying noises</summary>
+    <div style="display:flex; flex-direction:column; gap:6px; margin-top:6px;">
+      <button id="playaudio">&#9654; Play</button>
+      <label>Sweep: <input type="range" id="sweepspeed" min="1" max="16" value="4"> <span id="sweepval">4s</span></label>
+      <label>Volume: <input type="range" id="volume" min="0" max="100" value="30"></label>
+      <label>Lo Hz: <input type="number" id="freqlo" value="1000" min="20" max="2000" style="width:55px; background:#333; color:#aaa; border:1px solid #555; border-radius:3px; padding:2px;"></label>
+      <label>Hi Hz: <input type="number" id="freqhi" value="4000" min="100" max="16000" style="width:55px; background:#333; color:#aaa; border:1px solid #555; border-radius:3px; padding:2px;"></label>
+    </div>
+  </details>
   <span id="fps"></span>
 </div>
 <div id="labels"></div>
@@ -74,6 +84,10 @@
 <script>
 const canvas = document.getElementById('c');
 let initialized = false;
+
+// Audio sweep constants
+const READBACK_SIZE = 256;
+const N_OSC = 128;
 
 // Initial SIZE based on window (matches original single-disc quality)
 const SIZE = Math.min(window.innerWidth, window.innerHeight);
@@ -127,6 +141,18 @@ for (const t of [texA,texB,texC,texT]) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, init);
 }
 const fboA=makeFBO(texA), fboB=makeFBO(texB), fboC=makeFBO(texC), fboT=makeFBO(texT);
+
+// Readback FBO for audio sweep sampling
+const readbackTex = (function(){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,READBACK_SIZE,READBACK_SIZE,0,gl.RGBA,gl.FLOAT,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  return t;
+})();
+const readbackFBO = makeFBO(readbackTex);
 
 const qb=gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, qb);
@@ -281,6 +307,7 @@ uniform vec3 uTint;
 uniform int uGrid;
 uniform float uSc;
 uniform int uBorder;
+uniform float uSweep;
 void main(){
   vec2 c = uv - 0.5;
   float r2 = dot(c,c);
@@ -303,6 +330,13 @@ void main(){
     float g = smoothstep(lineW, 0.0, min(gx, gy));
     float circle = smoothstep(lineW*2.5, 0.0, abs(length(w)-uSc*0.5));
     v = mix(v, vec3(1.0), max(g, circle) * 0.7);
+  }
+  if (uSweep >= 0.0) {
+    vec2 dir = vec2(cos(uSweep), sin(uSweep));
+    float along = dot(c, dir);
+    float perp = abs(c.x*dir.y - c.y*dir.x);
+    float glow = smoothstep(0.004, 0.0, perp) * step(0.0, along);
+    v = mix(v, vec3(1.0, 0.9, 0.5), glow * 0.8);
   }
   fragColor=vec4(v,1);
 }`);
@@ -328,7 +362,7 @@ void main(){
 const baseAngles=new Float32Array(252), vels=new Float32Array(252);
 for(let i=0;i<252;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4;}
 
-let nFuncs=3, pp=0, frame=0, lastT=performance.now(), fpsS=0;
+let nFuncs=2, pp=0, frame=0, lastT=performance.now(), fpsS=0;
 const logMax=new Float32Array([1,1,1]);
 const phases=new Float32Array(252);
 const runAvg=[1,1,1];
@@ -412,6 +446,131 @@ function resetImage(){
   logMax[0]=1; logMax[1]=1; logMax[2]=1;
 }
 
+/* ---- Audio Sweep ---- */
+
+let audioCtx = null, masterGain = null;
+let oscillators = [], gainNodes = [];
+let sweepAngle = 0, audioPlaying = false;
+const readbackPx = new Float32Array(READBACK_SIZE * READBACK_SIZE * 4);
+
+const N_WAVES = 32;
+let periodicWaves = [];
+
+function pixelHue(r, g, b) {
+  const mx = Math.max(r, g, b);
+  const mn = Math.min(r, g, b);
+  const d = mx - mn;
+  if (d < 1e-6) return 0;
+  let h;
+  if (mx === r) h = ((g - b) / d + 6) % 6;
+  else if (mx === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return h / 6;
+}
+
+function createWaves() {
+  periodicWaves = [];
+  const nH = 24;
+  for (let w = 0; w < N_WAVES; w++) {
+    const hue = w / N_WAVES;
+    const angle = hue * 2 * Math.PI;
+    const real = new Float32Array(nH + 1);
+    const imag = new Float32Array(nH + 1);
+    // Rolloff: high = pure/mellow, low = rich/buzzy
+    const rolloff = 1.8 + Math.cos(angle) * 0.4;
+    // Even harmonic suppression varies with hue region
+    const evenMix = 0.3 + 0.7 * Math.pow(Math.sin(angle + 1), 2);
+    for (let h = 1; h <= nH; h++) {
+      const base = 1.0 / Math.pow(h, rolloff);
+      const evenFactor = (h % 2 === 0) ? evenMix : 1.0;
+      imag[h] = base * evenFactor;
+    }
+    periodicWaves.push(audioCtx.createPeriodicWave(real, imag));
+  }
+}
+
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = parseFloat(document.getElementById('volume').value) / 100;
+  masterGain.connect(audioCtx.destination);
+  createWaves();
+  rebuildOscillators();
+}
+
+function rebuildOscillators() {
+  if (!audioCtx) return;
+  for (const o of oscillators) { o.stop(); o.disconnect(); }
+  for (const g of gainNodes) g.disconnect();
+  oscillators = []; gainNodes = [];
+  const lo = parseFloat(document.getElementById('freqlo').value);
+  const hi = parseFloat(document.getElementById('freqhi').value);
+  for (let i = 0; i < N_OSC; i++) {
+    const t = i / (N_OSC - 1);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = lo * Math.pow(hi / lo, t);
+    if (periodicWaves.length > 0) osc.setPeriodicWave(periodicWaves[0]);
+    else osc.type = 'sine';
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start();
+    oscillators.push(osc);
+    gainNodes.push(gain);
+  }
+}
+
+function updateAudio() {
+  if (!audioCtx || !audioPlaying) return;
+
+  // Readback current image to small texture
+  const srcTex = pp === 0 ? texA : texB;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, readbackFBO);
+  gl.viewport(0, 0, READBACK_SIZE, READBACK_SIZE);
+  gl.useProgram(normProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.uniform1i(gl.getUniformLocation(normProg,'uD'), 0);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uS'), new Float32Array([1,1,1]));
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uBoost'), new Float32Array([0,0,0]));
+  drawQ(normProg);
+  gl.readPixels(0, 0, READBACK_SIZE, READBACK_SIZE, gl.RGBA, gl.FLOAT, readbackPx);
+
+  // Sample along the sweep radius
+  const cx = READBACK_SIZE / 2, cy = READBACK_SIZE / 2;
+  const maxR = READBACK_SIZE * 0.475;
+  const cosA = Math.cos(sweepAngle), sinA = Math.sin(sweepAngle);
+  const amps = new Float32Array(N_OSC);
+
+  for (let i = 0; i < N_OSC; i++) {
+    const t = i / (N_OSC - 1);
+    const r = t * maxR;
+    const x = Math.round(cx + r * cosA);
+    const y = Math.round(cy + r * sinA);
+    if (x >= 0 && x < READBACK_SIZE && y >= 0 && y < READBACK_SIZE) {
+      const idx = (y * READBACK_SIZE + x) * 4;
+      const pr = readbackPx[idx], pg = readbackPx[idx+1], pb = readbackPx[idx+2];
+      const lum = (pr + pg + pb) / 3;
+      amps[i] = Math.log(1 + Math.abs(lum));
+
+      // Hue selects waveform shape
+      const hue = pixelHue(pr, pg, pb);
+      const wIdx = Math.min(N_WAVES - 1, Math.floor(hue * N_WAVES));
+      oscillators[i].setPeriodicWave(periodicWaves[wIdx]);
+    }
+  }
+
+  // Set oscillator gains (fixed scale — dark areas stay quiet)
+  const vol = parseFloat(document.getElementById('volume').value) / 100;
+  masterGain.gain.setTargetAtTime(vol, audioCtx.currentTime, 0.05);
+  const scale = 1.0 / N_OSC;
+  const now = audioCtx.currentTime;
+  for (let i = 0; i < N_OSC; i++) {
+    gainNodes[i].gain.setTargetAtTime(amps[i] * scale, now, 0.03);
+  }
+}
+
 /* ---- Iteration ---- */
 
 function setIterUniforms(srcTex, ang, st, aa) {
@@ -483,6 +642,7 @@ function setDispUniforms(tex, tint, grid, border) {
   gl.uniform1i(gl.getUniformLocation(dispProg,'uGrid'),grid?1:0);
   gl.uniform1f(gl.getUniformLocation(dispProg,'uSc'),SCALE);
   gl.uniform1i(gl.getUniformLocation(dispProg,'uBorder'),border?1:0);
+  gl.uniform1f(gl.getUniformLocation(dispProg,'uSweep'), audioPlaying ? sweepAngle : -1.0);
 }
 
 function displayDisc(tex, cell, tint, grid) {
@@ -588,16 +748,35 @@ document.getElementById('showpermap').addEventListener('change', function(){
   document.getElementById('gridlabel').style.display = this.checked ? '' : 'none';
   resize();
 });
+document.getElementById('playaudio').addEventListener('click', function(){
+  if (!audioCtx) initAudio();
+  audioPlaying = !audioPlaying;
+  this.textContent = audioPlaying ? '\u23f8 Stop' : '\u25b6 Play';
+  if (!audioPlaying) {
+    for (const g of gainNodes) g.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
+  }
+});
+document.getElementById('sweepspeed').addEventListener('input', function(){
+  document.getElementById('sweepval').textContent = this.value + 's';
+});
+document.getElementById('freqlo').addEventListener('change', rebuildOscillators);
+document.getElementById('freqhi').addEventListener('change', rebuildOscillators);
 
 /* ---- Main loop ---- */
 
 function loop(){
-  const speedPct=document.getElementById('speed').value/100.0;
+  const speedPct=document.getElementById('speed').value/2000.0;
   const dt=1.0/60.0;
   for(let i=0;i<252;i++) phases[i]+=vels[i]*dt*speedPct;
   currentAng=new Float32Array(252);
   for(let i=0;i<252;i++) currentAng[i]=baseAngles[i]+phases[i];
   doIter(currentAng);
+  if (audioPlaying) {
+    const secsPerRot = parseFloat(document.getElementById('sweepspeed').value);
+    sweepAngle += (2 * Math.PI / 60.0) / secsPerRot;
+    if (sweepAngle > 2 * Math.PI) sweepAngle -= 2 * Math.PI;
+    updateAudio();
+  }
   display();
   if(frame%100===0){
     const rFBO=pp===0?fboA:fboB;
