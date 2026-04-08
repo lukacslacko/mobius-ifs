@@ -44,6 +44,7 @@
   </select></label>
   <label id="densitylabel" style="display:none">Density: <input type="range" id="density" min="1" max="400" value="80"></label>
   <label id="thresholdlabel">Threshold: <input type="range" id="threshold" min="0" max="100" value="50"></label>
+  <label><input type="checkbox" id="normq"> Normalize coefficients</label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <button id="randomize">Randomize</button>
@@ -129,6 +130,7 @@ uniform int numDeg;
 uniform int denDeg;
 uniform float cw;
 uniform vec3 uScale;
+uniform int normQ;
 
 // Quaternion: vec4(real, i, j, k)
 vec4 qmul(vec4 p, vec4 q) {
@@ -145,7 +147,12 @@ vec4 qinv(vec4 q) {
 }
 
 vec4 getQ(int idx) {
-  return vec4(a[idx], a[idx+1], a[idx+2], a[idx+3]);
+  vec4 q = vec4(a[idx], a[idx+1], a[idx+2], a[idx+3]);
+  if (normQ == 1) {
+    float n = length(q);
+    if (n > 1e-6) q /= n;
+  }
+  return q;
 }
 
 // Horner evaluation of quaternion polynomial: c0*p^deg + c1*p^{deg-1} + ... + c_deg
@@ -440,6 +447,7 @@ function doIter(ang) {
   gl.uniform1i(gl.getUniformLocation(iterProg, 'numDeg'), parseInt(document.getElementById('numdeg').value));
   gl.uniform1i(gl.getUniformLocation(iterProg, 'denDeg'), parseInt(document.getElementById('dendeg').value));
   gl.uniform1f(gl.getUniformLocation(iterProg, 'cw'), document.getElementById('colorwt').value / 100.0);
+  gl.uniform1i(gl.getUniformLocation(iterProg, 'normQ'), document.getElementById('normq').checked ? 1 : 0);
   gl.uniform3fv(gl.getUniformLocation(iterProg, 'uScale'), runAvg);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
