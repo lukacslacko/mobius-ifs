@@ -43,11 +43,13 @@
     <option value="surface" selected>Surface</option>
   </select></label>
   <label id="densitylabel" style="display:none">Density: <input type="range" id="density" min="1" max="400" value="80"></label>
+  <label id="gammalabel" style="display:none">Gamma: <input type="range" id="gamma" min="10" max="500" value="100"></label>
   <label id="thresholdlabel">Threshold: <input type="range" id="threshold" min="0" max="100" value="50"></label>
   <label><input type="checkbox" id="normq" checked> Normalize coefficients</label>
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label>Speed: <input type="range" id="speed" min="0" max="200" value="25"></label>
   <button id="randomize">Randomize</button>
+  <button id="export">Export params</button>
   <span id="fps"></span>
 </div>
 <canvas id="c"></canvas>
@@ -227,6 +229,7 @@ uniform vec3 uCamRight;
 uniform vec3 uCamUp;
 uniform vec3 uCamFwd;
 uniform float uDensity;
+uniform float uGamma;
 uniform float uFov;
 uniform float uVoxSize;
 uniform int uMode; // 0=volume, 1=surface
@@ -301,6 +304,7 @@ void main(){
     vec3 d = texture(uVol, uvw).rgb;
     float dens = (d.r + d.g + d.b) / 3.0;
     if(dens < 0.01) continue;
+    dens = pow(dens, uGamma);
 
     float a = 1.0 - exp(-dens * dt * uDensity);
     vec3 c = d / max(dens, 0.001);
@@ -539,6 +543,7 @@ function display() {
   gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamUp'), up);
   gl.uniform3fv(gl.getUniformLocation(dispProg, 'uCamFwd'), fwd);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uDensity'), document.getElementById('density').value / 10.0);
+  gl.uniform1f(gl.getUniformLocation(dispProg, 'uGamma'), document.getElementById('gamma').value / 100.0);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uFov'), 1.0 / camDist);
   gl.uniform1f(gl.getUniformLocation(dispProg, 'uVoxSize'), 1.0 / N);
   const surfMode = document.getElementById('rendermode').value === 'surface' ? 1 : 0;
@@ -594,7 +599,28 @@ document.getElementById('voxres').addEventListener('change', function(){
 });
 document.getElementById('rendermode').addEventListener('change', function(){
   document.getElementById('densitylabel').style.display = this.value === 'volume' ? '' : 'none';
+  document.getElementById('gammalabel').style.display = this.value === 'volume' ? '' : 'none';
   document.getElementById('thresholdlabel').style.display = this.value === 'surface' ? '' : 'none';
+  document.getElementById('export').style.display = this.value === 'surface' ? '' : 'none';
+});
+document.getElementById('export').addEventListener('click', function(){
+  const ang = new Float32Array(NPARAMS);
+  for (let i = 0; i < NPARAMS; i++) ang[i] = Math.sin(baseAngles[i] + phases[i]);
+  const params = {
+    version: 1,
+    nT: nFuncs,
+    numDeg: parseInt(document.getElementById('numdeg').value),
+    denDeg: parseInt(document.getElementById('dendeg').value),
+    normalize: document.getElementById('normq').checked,
+    colorWeight: document.getElementById('colorwt').value / 100.0,
+    thresholdPct: parseInt(document.getElementById('threshold').value),
+    ang: Array.from(ang)
+  };
+  const blob = new Blob([JSON.stringify(params, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'fractal_params.json'; a.click();
+  URL.revokeObjectURL(url);
 });
 
 function loop() {
