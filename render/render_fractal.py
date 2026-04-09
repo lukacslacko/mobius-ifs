@@ -2,20 +2,34 @@
 Blender render script for quaternion IFS fractal meshes.
 
 Usage:
-    blender --background --python render_fractal.py -- fractal.ply [output.png]
+    blender --background --python render_fractal.py -- fractal.ply [output.png] [params.json]
 
 Options after '--':
     arg 1: PLY file path (required)
     arg 2: output image path (default: fractal_render.png)
+    arg 3: params JSON file (optional, for camera position)
 """
 import bpy
 import sys
 import math
 import os
+import json
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ply_path = os.path.abspath(argv[0]) if argv else os.path.abspath("fractal.ply")
 output_path = os.path.abspath(argv[1]) if len(argv) > 1 else os.path.abspath("fractal_render.png")
+params_path = os.path.abspath(argv[2]) if len(argv) > 2 else None
+
+# Load camera from params JSON if provided
+cam_az = 0.0
+cam_el = 0.3
+cam_dist = 2.2
+if params_path and os.path.exists(params_path):
+    with open(params_path) as f:
+        params = json.load(f)
+    cam_az = params.get("camAz", cam_az)
+    cam_el = params.get("camEl", cam_el)
+    cam_dist = params.get("camDist", cam_dist)
 
 # Clear default scene
 bpy.ops.object.select_all(action='SELECT')
@@ -103,15 +117,17 @@ add_area_light("Key",  (3, -2, 4),  500, 2)
 add_area_light("Fill", (-3, -1, 2), 200, 3)
 add_area_light("Rim",  (0, 3, 2),   300, 1.5)
 
-# Camera
-bpy.ops.object.camera_add(location=(2.8, -2.8, 2.0))
+# Camera — match browser viewpoint from params
+cam_x = math.sin(cam_az) * math.cos(cam_el) * cam_dist
+cam_y = math.sin(cam_el) * cam_dist
+cam_z = math.cos(cam_az) * math.cos(cam_el) * cam_dist
+# Browser coords: x=right, y=up, z=toward viewer → Blender: X=right, Y=into screen, Z=up
+cam_loc = (cam_x, -cam_z, cam_y)
+bpy.ops.object.camera_add(location=cam_loc)
 cam = bpy.context.object
 cam.data.lens = 50
 cam.data.clip_end = 100
-
-# Point camera at origin
-direction = mathutils_look_at((2.8, -2.8, 2.0), (0, 0, 0))
-cam.rotation_euler = direction
+cam.rotation_euler = mathutils_look_at(cam_loc, (0, 0, 0))
 
 bpy.context.scene.camera = cam
 

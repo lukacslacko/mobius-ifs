@@ -614,6 +614,9 @@ document.getElementById('export').addEventListener('click', function(){
     normalize: document.getElementById('normq').checked,
     colorWeight: document.getElementById('colorwt').value / 100.0,
     thresholdPct: parseInt(document.getElementById('threshold').value),
+    camAz: camAz,
+    camEl: camEl,
+    camDist: camDist,
     ang: Array.from(ang)
   };
   const blob = new Blob([JSON.stringify(params, null, 2)], {type: 'application/json'});

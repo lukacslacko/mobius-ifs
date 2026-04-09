@@ -13,7 +13,17 @@ pub struct FractalParams {
     pub color_weight: f32,
     #[serde(rename = "thresholdPct")]
     pub threshold_pct: u32,
+    #[serde(rename = "camAz", default)]
+    pub cam_az: f32,
+    #[serde(rename = "camEl", default)]
+    pub cam_el: f32,
+    #[serde(rename = "camDist", default = "default_cam_dist")]
+    pub cam_dist: f32,
     pub ang: Vec<f32>,
+}
+
+fn default_cam_dist() -> f32 {
+    2.2
 }
 
 impl FractalParams {
