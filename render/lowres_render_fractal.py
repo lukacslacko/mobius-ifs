@@ -107,7 +107,7 @@ bpy.context.scene.camera = cam
 
 # Render settings — EEVEE for speed
 scene = bpy.context.scene
-scene.render.engine = 'BLENDER_EEVEE_NEXT'
+scene.render.engine = 'BLENDER_EEVEE'
 scene.render.resolution_x = 1920
 scene.render.resolution_y = 1080
 scene.render.filepath = output_path
