@@ -66,7 +66,7 @@
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label><input type="checkbox" id="showpermap"> Components</label>
   <label id="gridlabel" style="display:none"><input type="checkbox" id="showgrid" checked> Grid</label>
-  <label><input type="checkbox" id="fullplane"> Full plane</label>
+  <label><input type="checkbox" id="fullplane" checked> Full plane</label>
   <button id="randomize">Randomize</button>
   <details style="border-top:1px solid #555; margin-top:4px; padding-top:4px;">
     <summary style="cursor:pointer;">Annoying noises</summary>
@@ -574,6 +574,9 @@ function clearLabels() {
 }
 
 initialized = true;
+// Re-run now that layout state is known, so a default-checked Full plane /
+// Components box gets the correct (full-window) canvas size on first load.
+resize();
 
 /* ---- Drawing helpers ---- */
 
