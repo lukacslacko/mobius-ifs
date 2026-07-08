@@ -66,6 +66,7 @@
   <label>Color: <input type="range" id="colorwt" min="100" max="500" value="200"></label>
   <label><input type="checkbox" id="showpermap"> Components</label>
   <label id="gridlabel" style="display:none"><input type="checkbox" id="showgrid" checked> Grid</label>
+  <label><input type="checkbox" id="fullplane"> Full plane</label>
   <button id="randomize">Randomize</button>
   <details style="border-top:1px solid #555; margin-top:4px; padding-top:4px;">
     <summary style="cursor:pointer;">Annoying noises</summary>
@@ -94,13 +95,17 @@ const SIZE = Math.min(window.innerWidth, window.innerHeight);
 const SCALE = 4.0;
 
 function resize() {
-  const multi = initialized && document.getElementById('showpermap').checked;
+  const multi = initialized && (document.getElementById('showpermap').checked
+                              || document.getElementById('fullplane').checked);
   if (multi) {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
     canvas.style.width = window.innerWidth + 'px';
     canvas.style.height = window.innerHeight + 'px';
-    updateLabels();
+    // Component labels only apply to the Components (multi-disc) view.
+    if (document.getElementById('showpermap').checked
+        && !document.getElementById('fullplane').checked) updateLabels();
+    else clearLabels();
   } else {
     const s = Math.min(window.innerWidth, window.innerHeight);
     canvas.width = s; canvas.height = s;
@@ -136,11 +141,14 @@ const init = new Float32Array(SIZE*SIZE*4);
 for (let i = 0; i < SIZE*SIZE; i++) { init[i*4]=1; init[i*4+1]=1; init[i*4+2]=1; init[i*4+3]=1; }
 
 const texA=makeTex(), texB=makeTex(), texC=makeTex(), texT=makeTex();
-for (const t of [texA,texB,texC,texT]) {
+// Outside-chart (inverted disc) ping-pong + scratch for full-plane mode
+const texAo=makeTex(), texBo=makeTex(), texCo=makeTex();
+for (const t of [texA,texB,texC,texT,texAo,texBo,texCo]) {
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, SIZE, SIZE, 0, gl.RGBA, gl.FLOAT, init);
 }
 const fboA=makeFBO(texA), fboB=makeFBO(texB), fboC=makeFBO(texC), fboT=makeFBO(texT);
+const fboAo=makeFBO(texAo), fboBo=makeFBO(texBo), fboCo=makeFBO(texCo);
 
 // Readback FBO for audio sweep sampling
 const readbackTex = (function(){
@@ -182,6 +190,11 @@ uniform int numExp;
 uniform int denExp;
 uniform int singleT;
 uniform int doAA;
+uniform int uFullPlane;   // 1 = Riemann-sphere two-chart mode
+uniform int uChart;       // 0 = inside disc, 1 = inverted outside disc
+uniform sampler2D uDo;    // old density, outside chart
+uniform float uRd;        // disc radius (= sc/2)
+uniform float uTexel;     // 1/SIZE, finite-difference step in uv
 
 vec2 cm(vec2 a,vec2 b){return vec2(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x);}
 
@@ -266,7 +279,108 @@ vec3 sampleAt(vec2 w){
   );
 }
 
+/* ---- Full-plane (Riemann sphere) support ---- */
+// A sphere point is carried as a homogeneous pair [Z0,Z1], z = Z1/Z0,
+// so the point at infinity (Z0=0) is representable without overflow.
+
+vec2 cvec(float ang){return vec2(cos(ang),sin(ang));}
+vec2 cconj(vec2 z){return vec2(z.x,-z.y);}
+vec2 cdiv(vec2 a,vec2 b){float d=max(dot(b,b),1e-30);
+  return vec2(a.x*b.x+a.y*b.y, a.y*b.x-a.x*b.y)/d;}
+// integer power via polar form: robust for large |n| and any magnitude
+vec2 cpowi(vec2 z,int n){
+  float r=length(z);
+  if(r<1e-30) return (n==0)?vec2(1.0,0.0):vec2(0.0,0.0);
+  float th=atan(z.y,z.x);
+  float rn=pow(r,float(n));
+  return rn*vec2(cos(float(n)*th),sin(float(n)*th));
+}
+// homogeneous evaluation of a Horner polynomial: returns P(w)*W0^deg with w=W1/W0
+vec2 evalHom(vec2 W0,vec2 W1,int off,int deg){
+  vec2 r=cvec(a[off]);
+  vec2 w0p=vec2(1.0,0.0);
+  for(int k=1;k<=20;k++){ if(k>deg) break; w0p=cm(w0p,W0); r=cm(r,W1)+cm(cvec(a[off+k]),w0p); }
+  return r;
+}
+// image of transform t on the sphere, in homogeneous coords: z = Z1/Z0
+void evalFhom(vec2 W0,vec2 W1,int t,out vec2 Z0,out vec2 Z1){
+  // normalize the homogeneous pair (projectively invariant) so |W0|,|W1| <= 1;
+  // keeps every power of W0 bounded -> no overflow at high polynomial degree.
+  float s=max(max(length(W0),length(W1)),1e-30);
+  W0/=s; W1/=s;
+  int base=t*42;
+  int numOff=base;
+  int denOff=base+numDeg+1;
+  vec2 Ph=evalHom(W0,W1,numOff,numDeg);
+  vec2 Qh=evalHom(W0,W1,denOff,denDeg);
+  vec2 Nh=cpow(Ph,numExp);
+  vec2 Dh=cpow(Qh,denExp);
+  int dn=numDeg*numExp;
+  int dd=denDeg*denExp;
+  int m=dd-dn;
+  if(m>=0){ Z1=cm(Nh,cpowi(W0,m)); Z0=Dh; }
+  else    { Z1=Nh;                 Z0=cm(Dh,cpowi(W0,-m)); }
+}
+// chordal distance on the sphere between homogeneous points (bounded, no infinities)
+float chordH(vec2 A0,vec2 A1,vec2 B0,vec2 B1){
+  vec2 cr=cm(A0,B1)-cm(A1,B0);
+  float na=sqrt(dot(A0,A0)+dot(A1,A1));
+  float nb=sqrt(dot(B0,B0)+dot(B1,B1));
+  return length(cr)/max(na*nb,1e-30);
+}
+// sample old density at sphere point [Z0,Z1] from whichever chart contains it
+vec3 sampleSphere(vec2 Z0,vec2 Z1){
+  float Rd2=uRd*uRd;
+  if(dot(Z1,Z1) <= Rd2*dot(Z0,Z0)){        // |z| <= Rd -> inside chart
+    vec2 z=cdiv(Z1,Z0);
+    return texture(uD, z/sc+0.5).rgb;
+  } else {                                  // |z| >  Rd -> inverted outside chart
+    vec2 uz=Rd2*cm(Z1,cconj(Z0))/max(dot(Z1,Z1),1e-30);  // Rd2*z/|z|^2
+    return texture(uDo, uz/sc+0.5).rgb;
+  }
+}
+vec4 fullPlaneIter(){
+  float Rd2=uRd*uRd;
+  vec2 loc =(uv-0.5)*sc;                 // this chart's local (disc) coordinate
+  // Note: we compute the *whole* square, not just the inscribed disc. The band
+  // beyond |loc|=Rd is a valid continuation of the other chart, so bilinear
+  // sampling across the |w|=Rd boundary interpolates real data (no seam).
+  vec2 locE=(uv+vec2(uTexel,0.0)-0.5)*sc;
+  // target and finite-difference neighbour as homogeneous sphere points
+  vec2 P0,P1,Pe0,Pe1;
+  if(uChart==0){                         // inside: actual point w = loc
+    P0=vec2(1.0,0.0); P1=loc;
+    Pe0=vec2(1.0,0.0); Pe1=locE;
+  } else {                               // outside: actual point w = Rd2/conj(loc)
+    P0=cconj(loc);  P1=vec2(Rd2,0.0);
+    Pe0=cconj(locE); Pe1=vec2(Rd2,0.0);
+  }
+  float din=chordH(P0,P1,Pe0,Pe1);
+  vec3 acc=vec3(0.0), wTotal=vec3(0.0);
+  for(int t=0;t<6;t++){
+    if(t>=nT) break;
+    if(singleT>=0 && t!=singleT) continue;
+    vec2 Z0,Z1,Ze0,Ze1;
+    evalFhom(P0,P1,t,Z0,Z1);
+    evalFhom(Pe0,Pe1,t,Ze0,Ze1);
+    float dout=chordH(Z0,Z1,Ze0,Ze1);
+    float sd=dout/max(din,1e-9);          // spherical derivative
+    float j=min(sd*sd, 30.0);             // round-sphere area Jacobian
+    vec3 cwt=colorWeight(t);
+    acc += sampleSphere(Z0,Z1) * j * cwt;
+    wTotal += cwt;
+  }
+  vec3 v=vec3(
+    wTotal.r>0.0 ? acc.r/wTotal.r : 0.0,
+    wTotal.g>0.0 ? acc.g/wTotal.g : 0.0,
+    wTotal.b>0.0 ? acc.b/wTotal.b : 0.0
+  );
+  v=clamp(v, vec3(0.001), vec3(100.0));
+  return vec4(v,1.0);
+}
+
 void main(){
+  if(uFullPlane==1){ fragColor=fullPlaneIter(); return; }
   vec2 w=(uv-0.5)*sc;
   float R2 = sc*sc*0.25;
   if(dot(w,w) > R2){ fragColor=vec4(0.001,0.001,0.001,1); return; }
@@ -359,10 +473,46 @@ void main(){
   fragColor = vec4(d, 1.0);
 }`);
 
+// Full-plane display: one seamless image of the plane. Central disc from the
+// inside texture "as is"; the exterior filled by the inverted outside texture.
+const planeProg = pr(VS, `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 fragColor;
+uniform sampler2D uDin;
+uniform sampler2D uDout;
+uniform vec3 uLM;
+uniform float uG;
+uniform vec3 uTint;
+uniform float uSc;
+uniform float uRd;
+uniform vec2 uRes;
+uniform float uViewR;
+void main(){
+  vec2 px = uv * uRes;
+  float h = 0.5 * min(uRes.x, uRes.y);
+  vec2 w = (px - 0.5*uRes) / h * uViewR;   // plane coord, aspect-correct
+  float r2 = dot(w,w);
+  float Rd2 = uRd*uRd;
+  vec3 d;
+  if (r2 <= Rd2) {
+    d = texture(uDin, w/uSc + 0.5).rgb;
+  } else {
+    vec2 u = Rd2 * w / r2;                  // inversion; seamless at |w|=Rd
+    d = texture(uDout, u/uSc + 0.5).rgb;
+  }
+  d *= uTint;
+  vec3 v;
+  v.r = uLM.r>0.001 ? pow(clamp(log(1.0+abs(d.r))/uLM.r,0.0,1.0),uG) : 0.0;
+  v.g = uLM.g>0.001 ? pow(clamp(log(1.0+abs(d.g))/uLM.g,0.0,1.0),uG) : 0.0;
+  v.b = uLM.b>0.001 ? pow(clamp(log(1.0+abs(d.b))/uLM.b,0.0,1.0),uG) : 0.0;
+  fragColor = vec4(v,1.0);
+}`);
+
 const baseAngles=new Float32Array(252), vels=new Float32Array(252);
 for(let i=0;i<252;i++){baseAngles[i]=Math.random()*Math.PI*2; vels[i]=(Math.random()-0.5)*0.4;}
 
 let nFuncs=2, pp=0, frame=0, lastT=performance.now(), fpsS=0;
+let fullPlane=false;
 const logMax=new Float32Array([1,1,1]);
 const phases=new Float32Array(252);
 const runAvg=[1,1,1];
@@ -439,7 +589,7 @@ function resetImage(){
   frame=0; runAvg[0]=1; runAvg[1]=1; runAvg[2]=1;
   const d=new Float32Array(SIZE*SIZE*4);
   for(let i=0;i<SIZE*SIZE;i++){d[i*4]=1;d[i*4+1]=1;d[i*4+2]=1;d[i*4+3]=1;}
-  for(const t of[texA,texB,texC]){
+  for(const t of[texA,texB,texC,texAo,texBo,texCo]){
     gl.bindTexture(gl.TEXTURE_2D,t);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIZE,SIZE,0,gl.RGBA,gl.FLOAT,d);
   }
@@ -588,6 +738,22 @@ function setIterUniforms(srcTex, ang, st, aa) {
   gl.uniform1i(gl.getUniformLocation(iterProg,'denExp'),parseInt(document.getElementById('denexp').value));
   gl.uniform1i(gl.getUniformLocation(iterProg,'singleT'),st);
   gl.uniform1i(gl.getUniformLocation(iterProg,'doAA'),aa);
+  // Full-plane defaults (off); overridden by setFullUniforms when in that mode.
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uFullPlane'),0);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uChart'),0);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'uRd'),SCALE/2.0);
+  gl.uniform1f(gl.getUniformLocation(iterProg,'uTexel'),1.0/SIZE);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texAo);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uDo'),1);
+}
+
+function setFullUniforms(chart, outOldTex) {
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uFullPlane'),1);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uChart'),chart);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, outOldTex);
+  gl.uniform1i(gl.getUniformLocation(iterProg,'uDo'),1);
 }
 
 function doIter(ang){
@@ -626,6 +792,64 @@ function doIter(ang){
   gl.uniform3fv(gl.getUniformLocation(normProg,'uS'),sc);
   gl.uniform3fv(gl.getUniformLocation(normProg,'uBoost'),boost);
   drawQ(normProg);
+  pp=1-pp;
+}
+
+function normBlit(srcTex, wFBO, scArr){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,wFBO);
+  gl.viewport(0,0,SIZE,SIZE);
+  gl.useProgram(normProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D,srcTex);
+  gl.uniform1i(gl.getUniformLocation(normProg,'uD'),0);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uS'),scArr);
+  gl.uniform3fv(gl.getUniformLocation(normProg,'uBoost'),new Float32Array(3));
+  drawQ(normProg);
+}
+
+// Full-plane: iterate both hemispheres (inside disc + inverted outside disc).
+function doIterFull(ang){
+  const inOld  = pp===0 ? texA  : texB;
+  const outOld = pp===0 ? texAo : texBo;
+  const inWFBO  = pp===0 ? fboB  : fboA;
+  const outWFBO = pp===0 ? fboBo : fboAo;
+
+  // inside chart -> fboC (scratch)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboC);
+  gl.viewport(0,0,SIZE,SIZE);
+  gl.useProgram(iterProg);
+  setIterUniforms(inOld, ang, -1, 0);
+  setFullUniforms(0, outOld);
+  drawQ(iterProg);
+
+  // outside chart -> fboCo (scratch)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboCo);
+  gl.viewport(0,0,SIZE,SIZE);
+  setIterUniforms(inOld, ang, -1, 0);
+  setFullUniforms(1, outOld);
+  drawQ(iterProg);
+
+  // brightness stabilization, sampled from the inside scratch (shared scale)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboC);
+  const buf=new Float32Array(4);
+  let sums=[0,0,0], cnt=0;
+  const ns=parseInt(document.getElementById('nsamp').value);
+  const st=Math.floor(SIZE/ns);
+  for(let y=0;y<SIZE;y+=st)for(let x=0;x<SIZE;x+=st){
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,buf);
+    sums[0]+=buf[0]; sums[1]+=buf[1]; sums[2]+=buf[2]; cnt++;
+  }
+  for(let c=0;c<3;c++) if(!isFinite(sums[c])) { resetImage(); pp=1-pp; return; }
+  if(sums[0]+sums[1]+sums[2] < 0.001*cnt){ resetImage(); pp=1-pp; return; }
+  for(let c=0;c<3;c++){
+    const avg = sums[c]/cnt;
+    if(!isFinite(avg)) { resetImage(); pp=1-pp; return; }
+    const desired = avg > 1e-10 ? Math.min(0.5/avg, 10.0) : 1.0;
+    runAvg[c] = runAvg[c]*0.98 + desired*0.02;
+  }
+  const scArr = new Float32Array([runAvg[0], runAvg[1], runAvg[2]]);
+  normBlit(texC,  inWFBO,  scArr);
+  normBlit(texCo, outWFBO, scArr);
   pp=1-pp;
 }
 
@@ -673,6 +897,33 @@ function display(){
       logMax[c]=logMax[c]*0.8+nl*0.2;
       if(logMax[c]<0.01)logMax[c]=0.01;
     }
+  }
+
+  if (fullPlane) {
+    // Full-plane: one seamless image of the plane (disc in the middle,
+    // inverted outside filling the rest of the screen).
+    const outTex = pp===0?texAo:texBo;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0,0,canvas.width,canvas.height);
+    gl.useProgram(planeProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.uniform1i(gl.getUniformLocation(planeProg,'uDin'),0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, outTex);
+    gl.uniform1i(gl.getUniformLocation(planeProg,'uDout'),1);
+    gl.uniform3fv(gl.getUniformLocation(planeProg,'uLM'),logMax);
+    gl.uniform1f(gl.getUniformLocation(planeProg,'uG'),0.45);
+    gl.uniform3fv(gl.getUniformLocation(planeProg,'uTint'),new Float32Array([1,1,1]));
+    gl.uniform1f(gl.getUniformLocation(planeProg,'uSc'),SCALE);
+    gl.uniform1f(gl.getUniformLocation(planeProg,'uRd'),SCALE/2.0);
+    gl.uniform2fv(gl.getUniformLocation(planeProg,'uRes'),new Float32Array([canvas.width,canvas.height]));
+    // Same zoom as the disc-only view: plane radius Rd maps to half the min
+    // screen dimension, so the central disc fills the height exactly as before;
+    // the inverted exterior only fills the extra margins/corners.
+    gl.uniform1f(gl.getUniformLocation(planeProg,'uViewR'),SCALE/2.0);
+    drawQ(planeProg);
+    return;
   }
 
   const multiDisc = document.getElementById('showpermap').checked;
@@ -748,6 +999,11 @@ document.getElementById('showpermap').addEventListener('change', function(){
   document.getElementById('gridlabel').style.display = this.checked ? '' : 'none';
   resize();
 });
+document.getElementById('fullplane').addEventListener('change', function(){
+  fullPlane = this.checked;
+  resize();
+  resetImage();
+});
 document.getElementById('playaudio').addEventListener('click', function(){
   if (!audioCtx) initAudio();
   audioPlaying = !audioPlaying;
@@ -770,7 +1026,8 @@ function loop(){
   for(let i=0;i<252;i++) phases[i]+=vels[i]*dt*speedPct;
   currentAng=new Float32Array(252);
   for(let i=0;i<252;i++) currentAng[i]=baseAngles[i]+phases[i];
-  doIter(currentAng);
+  fullPlane = document.getElementById('fullplane').checked;
+  if (fullPlane) doIterFull(currentAng); else doIter(currentAng);
   if (audioPlaying) {
     const secsPerRot = parseFloat(document.getElementById('sweepspeed').value);
     sweepAngle += (2 * Math.PI / 60.0) / secsPerRot;
