@@ -21,6 +21,10 @@ Open any HTML file directly in a browser — no build step or server required.
 - **ifs_raised.html** — Raised IFS surface
 - **quaternion.html** — Quaternion Mobius IFS with volumetric and surface rendering
 
+## HDR displays
+
+On an HDR screen (e.g. MacBook XDR panels) in a browser with WebGPU HDR canvas support (Chrome), `index.html` shows an **HDR** checkbox, enabled by default. The WebGL2 pipeline still renders the tone-mapped SDR image; a WebGPU pass then copies it on the GPU, boosts highlights above SDR white (adjustable via the **HDR boost** slider, 1–4×), and presents it on an `rgba16float` canvas with `toneMapping: extended`, so bright regions use the display's extended dynamic range. On SDR displays or browsers without support the checkbox is hidden and rendering is unchanged.
+
 ## Quaternion IFS
 
 `quaternion.html` renders fractals defined by quaternion Mobius transformations on a 3D voxel grid using WebGL2 compute-style shaders.
